@@ -114,7 +114,7 @@ class HorizontalStressesCalculation:
         return shmax_shmin_ratio
 
     @staticmethod
-    def calculate_poroelastic_horizontal_stresses_array(overburden_stress: list[float], pore_pressure: list[float], poisson_ratio: list[float], youngs_modulus: list[float], biot_coefficient: float = 1.0, EX: float = 0.0001, EY: float = 0.009) -> list[HorizontalStresses]:
+    def calculate_poroelastic_horizontal_stresses_array(overburden_stress: list[float], pore_pressure: list[float], poisson_ratio: list[float], youngs_modulus: list[float], biot_coefficient: list[float], EX: float = 0.0001, EY: float = 0.009) -> list[HorizontalStresses]:
         """Calculates horizontal stresses for arrays of inputs using the Poroelastic horizontal stress equation.
 
         Args:
@@ -134,11 +134,11 @@ class HorizontalStressesCalculation:
                 pore_pressure=pp,
                 poisson_ratio=pr,
                 youngs_modulus=ym,
-                biot_coefficient=biot_coefficient,
+                biot_coefficient=bc,
                 EX=EX,
                 EY=EY,
             )
-            for ovb, pp, pr, ym in zip(overburden_stress, pore_pressure, poisson_ratio, youngs_modulus, strict=True)
+            for ovb, pp, pr, ym, bc in zip(overburden_stress, pore_pressure, poisson_ratio, youngs_modulus, biot_coefficient, strict=True)
         ]
 
     @staticmethod

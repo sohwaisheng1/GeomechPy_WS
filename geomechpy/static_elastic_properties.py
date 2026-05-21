@@ -104,20 +104,20 @@ class StaticElasticPropertiesConverter:
         return yme_sta_morales
 
     @staticmethod
-    def convert_dyn2sta_yme_custom_power_law(measurement: float, multiplier: float, exponent: float) -> float:
+    def convert_dyn2sta_yme_custom_power_law(yme_dyn: float, multiplier: float, exponent: float) -> float:
         """Convert dynamic to static Young's modulus using a custom power law.
 
         Equation type: Power law (y = a*x**b)
         Applicable for: Generic.
 
         Args:
-           measurement (float): Dynamic Young's modulus magnitude. Unit: Mpsi
+           yme_dyn (float): Dynamic Young's modulus magnitude. Unit: Mpsi
            multiplier (float): Custom multiplier - from core data regression or alternative power law correlation Unit: unitless
            exponent (float): Custom exponent - from core data regression or alternative power law correlation  Unit: unitless
 
         Returns:
            yme_sta_morales: Static Young's modulus magnitude. Unit: Mpsi"""
-        yme_sta_power_law = multiplier * measurement**exponent
+        yme_sta_power_law = multiplier * yme_dyn**exponent
 
         return float(yme_sta_power_law)
 
@@ -239,11 +239,11 @@ class StaticElasticPropertiesConverter:
         ]
 
     @staticmethod
-    def convert_dyn2sta_yme_custom_power_law_array(measurement: list[float], multiplier: float, exponent: float) -> list[float]:
+    def convert_dyn2sta_yme_custom_power_law_array(yme_dyn: list[float], multiplier: float, exponent: float) -> list[float]:
         """Convert an array of dynamic Young's modulus values to static using a custom power law.
 
         Args:
-           measurement (list[float]): Dynamic Young's modulus values. Unit: Mpsi
+           yme_dyn (list[float]): Dynamic Young's modulus values. Unit: Mpsi
            multiplier (float): Custom multiplier from regression. Unit: unitless
            exponent (float): Custom exponent from regression. Unit: unitless
 
@@ -251,11 +251,11 @@ class StaticElasticPropertiesConverter:
            list[float]: Static Young's modulus values. Unit: Mpsi"""
         return [
             StaticElasticPropertiesConverter.convert_dyn2sta_yme_custom_power_law(
-                measurement=value,
+                yme_dyn=value,
                 multiplier=multiplier,
                 exponent=exponent,
             )
-            for value in measurement
+            for value in yme_dyn
         ]
 
     @staticmethod
