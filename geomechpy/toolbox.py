@@ -1,55 +1,71 @@
-import numpy as np
 import math
-from math import pi
+
+import numpy as np
+import numpy.typing as npt
 
 
-def roatate2shmax(SHMIN, SHMAX, SVERT, SHMAX_AZIM):
-    """Rotate the principal stress tensore into the direction of the maximum stress magnitude under the assumption that the vertical stress is not tilted
-       Reference: Jaeger, John Conrad, Neville GW Cook, and Robert Zimmerman. Fundamentals of rock mechanics. John Wiley & Sons, 2009, Chapter 2.3
-    Input:
-        SHMIN: Magnitude of the minimum stress
-        SHMAX: Magnitude of the maxium stress
-        SVERT: Magnitude of the vertical stress
-        SHMAX_AZIM: Direction of the maximum stress magnitude relative to Geographic NORTH Unit: degree
+def rotate_stress_to_shmax(
+    shmin: float,
+    shmax: float,
+    svert: float,
+    shmax_azimuth: float,
+) -> npt.NDArray[np.float64]:
+    """Rotate the principal stress tensor into the direction of the maximum horizontal stress.
 
-            Units: Pressure unit which needs to be consistent between the three stresses
+    Assumes the vertical stress is not tilted.
 
-    OUTPUT:
-        Stress Tensor in NEV coordinate system (North-East-Vertical)
-        Unit: same as input pressure unit
+    Reference:
+        Jaeger, John Conrad, Neville GW Cook, and Robert Zimmerman. Fundamentals of rock mechanics. John Wiley & Sons, 2009, Chapter 2.3.
 
+    Args:
+        shmin (float): Minimum horizontal stress magnitude. Unit: Pressure
+        shmax (float): Maximum horizontal stress magnitude. Unit: Pressure
+        svert (float): Vertical stress magnitude. Unit: Pressure
+        shmax_azimuth (float): Direction of the maximum horizontal stress magnitude relative to Geographic NORTH. Unit: [deg]
+
+    Returns:
+        npt.NDArray[np.float64]: Stress tensor in NEV coordinate system (North-East-Vertical). Unit: same as input pressure unit
     """
-    stress_tensor = [SHMAX, SHMIN, SVERT] * np.identity(3)  # Define the diagonal principal stress tensor
+    stress_tensor = [shmax, shmin, svert] * np.identity(3)
 
-    shmax_dir = SHMAX_AZIM * (math.pi / 180)  # Convert Stress direction into Radians
+    shmax_azimuth_rad = shmax_azimuth * (math.pi / 180)
 
-    NEV_rotation_matrix = np.array([[math.cos(shmax_dir), math.sin(shmax_dir), 0], [-math.sin(shmax_dir), math.cos(shmax_dir), 0], [0, 0, 1]])  # Construct the rotation matrix  # Provide Reference
+    nev_rotation_matrix = np.array([
+        [math.cos(shmax_azimuth_rad), math.sin(shmax_azimuth_rad), 0],
+        [-math.sin(shmax_azimuth_rad), math.cos(shmax_azimuth_rad), 0],
+        [0, 0, 1],
+    ])
 
-    # Perform the Matrix Multiplication Transposed(R)*S*R
-    aa1 = np.matmul(np.transpose(NEV_rotation_matrix), stress_tensor)
-    stress_NEV = np.matmul(aa1, (NEV_rotation_matrix))
-    return stress_NEV
+    stress_nev = np.matmul(np.transpose(nev_rotation_matrix), np.matmul(stress_tensor, nev_rotation_matrix))
+    return stress_nev
 
 
-def rotNEV2TOH(DEVI, AZIM, stress_tensor):
-    """Rotate the stress tensor from geographic reference into the borehole reference system using top of hole as reference
+def rotate_nev_to_toh(
+    borehole_deviation: float,
+    borehole_azimuth: float,
+    stress_tensor_nev: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]:
+    """Rotate the stress tensor from the geographic reference into the borehole reference system using top of hole as reference.
+
+    Reference:
         Fjaer, Erling, et al. Petroleum related rock mechanics. Vol. 53. Elsevier, 2008; Appendix C; eq C.58.
 
-    Input:
-        DEVI: Borehole inclination Unit: [deg].
-        AZIM: Borehole azimuth Unit: [deg].
-        Stress Tensor in NEV coordinate system (North-East-Vertical) Unit: same as input pressure unit.
+    Args:
+        borehole_deviation (float): Borehole inclination. Unit: [deg]
+        borehole_azimuth (float): Borehole azimuth. Unit: [deg]
+        stress_tensor_nev (npt.NDArray[np.float64]): Stress tensor in NEV coordinate system (North-East-Vertical). Unit: Pressure
 
-    OUTPUT:
-        Stress Tensor in TOH coordinate system (Top of Hole)
-        Unit: same as input pressure unit
+    Returns:
+        npt.NDArray[np.float64]: Stress tensor in TOH coordinate system (Top of Hole). Unit: same as input pressure unit
     """
-    bh_azi = AZIM * (math.pi / 180)
-    bh_dev = DEVI * (math.pi / 180)
-    NEV2TOH = np.array(
-        [[math.cos(bh_azi) * math.cos(bh_dev), math.sin(bh_azi) * math.cos(bh_dev), -math.sin(bh_dev)], [-math.sin(bh_azi), math.cos(bh_azi), 0], [math.cos(bh_azi) * math.sin(bh_dev), math.sin(bh_azi) * math.sin(bh_dev), math.cos(bh_dev)]]
-    )
-    # Perform the Matrix Multiplication Transposed(R)*S*R
-    stress1 = np.matmul(NEV2TOH, stress_tensor)
-    stress_tensor_TOH = np.matmul(stress1, np.transpose(NEV2TOH))
-    return stress_tensor_TOH
+    bh_azimuth_rad = borehole_azimuth * (math.pi / 180)
+    bh_deviation_rad = borehole_deviation * (math.pi / 180)
+
+    nev_to_toh = np.array([
+        [math.cos(bh_azimuth_rad) * math.cos(bh_deviation_rad), math.sin(bh_azimuth_rad) * math.cos(bh_deviation_rad), -math.sin(bh_deviation_rad)],
+        [-math.sin(bh_azimuth_rad), math.cos(bh_azimuth_rad), 0],
+        [math.cos(bh_azimuth_rad) * math.sin(bh_deviation_rad), math.sin(bh_azimuth_rad) * math.sin(bh_deviation_rad), math.cos(bh_deviation_rad)],
+    ])
+
+    stress_tensor_toh = np.matmul(nev_to_toh, np.matmul(stress_tensor_nev, np.transpose(nev_to_toh)))
+    return stress_tensor_toh
