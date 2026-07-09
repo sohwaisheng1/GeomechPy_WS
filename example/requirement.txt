@@ -1,5 +1,6 @@
-streamlit
+streamlit>=1.38.0
 pandas
 numpy
-plotly
-geomechpy @ git+https://github.com/akutuev/GeomechPy.git
+plotly>=5.0.0
+matplotlib
+git+https://github.com/akutuev/GeomechPy.git
