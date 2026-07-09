@@ -1,1 +1,5 @@
-
+streamlit
+pandas
+numpy
+plotly
+geomechpy @ git+https://github.com/akutuev/GeomechPy.git
