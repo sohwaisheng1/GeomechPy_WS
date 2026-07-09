@@ -90,6 +90,9 @@ DISPLAY_SPEC: dict[str, tuple[str, tuple[str, float], tuple[str, float]]] = {
     "FANG_DEG": ("FANG", ("deg", 1.0), ("deg", 1.0)),
 }
 
+def get_unit_systems():
+    """Return list of available unit systems for the UI."""
+    return UNIT_SYSTEMS
 
 def _spec(canonical: str, unit_system: str) -> tuple[str, str, float]:
     """(display base name, unit string, factor from canonical) for a column."""
