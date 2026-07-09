@@ -4,6 +4,7 @@ Quick MEM Calculator - Streamlit front end.
 A one-page Mechanical Earth Model (MEM) starter built on the geomechpy
 library: dynamic elastic properties, dynamic-to-static conversion and
 rock strength, with QC flagging and interactive Plotly log displays.
+Supports Oilfield and Metric unit systems for both input and display.
 
 Run locally:   streamlit run app.py
 """
@@ -29,10 +30,12 @@ st.set_page_config(
 # Persist data across reruns
 for key, default in {
     "raw_df": None,        # uploaded / sample input data
-    "results_df": None,    # full workflow output
+    "results_df": None,    # full workflow output (canonical units)
     "qc_summary": None,
-    "qc_flags": None,
+    "qc_flags": None,      # per-sample QC flags (canonical column names)
     "data_source": None,   # label shown in the sidebar
+    "load_messages": [],   # info messages from the data cleaner
+    "unit_warnings": [],   # unit sanity warnings from the last run
 }.items():
     st.session_state.setdefault(key, default)
 
@@ -44,9 +47,9 @@ FLAG_COLORS = {
 }
 
 
-def style_flags(results: pd.DataFrame, flags: pd.DataFrame, columns: list[str]) -> "pd.io.formats.style.Styler":
-    """Color-code table cells according to their QC flag."""
-    shown = [c for c in columns if c in results.columns]
+def style_flags(table: pd.DataFrame, flags: pd.DataFrame, columns: list[str]) -> "pd.io.formats.style.Styler":
+    """Color-code table cells according to their QC flag (matching column names)."""
+    shown = [c for c in columns if c in table.columns]
 
     def _color(row_df: pd.DataFrame) -> pd.DataFrame:
         css = pd.DataFrame("", index=row_df.index, columns=row_df.columns)
@@ -55,10 +58,10 @@ def style_flags(results: pd.DataFrame, flags: pd.DataFrame, columns: list[str]) 
                 css[col] = flags.loc[row_df.index, col].map(FLAG_COLORS).fillna("")
         return css
 
-    return results[shown].style.apply(_color, axis=None).format(precision=3)
+    return table[shown].style.apply(_color, axis=None).format(precision=3)
 
 
-def depth_track_figure(df: pd.DataFrame, tracks: list[tuple[str, list[tuple[str, str]]]], height: int = 750) -> go.Figure:
+def depth_track_figure(df: pd.DataFrame, depth_col: str, tracks: list[tuple[str, list[tuple[str, str]]]], height: int = 750) -> go.Figure:
     """Build a multi-track log plot (property vs depth, depth increasing downwards).
 
     tracks: list of (track_title, [(column, legend_name), ...])
@@ -77,7 +80,7 @@ def depth_track_figure(df: pd.DataFrame, tracks: list[tuple[str, list[tuple[str,
             fig.add_trace(
                 go.Scatter(
                     x=df[col],
-                    y=df["DEPTH"],
+                    y=df[depth_col],
                     mode="lines",
                     name=name,
                     hovertemplate=f"{name}: %{{x:.3f}}<br>Depth: %{{y:.1f}}<extra></extra>",
@@ -85,7 +88,7 @@ def depth_track_figure(df: pd.DataFrame, tracks: list[tuple[str, list[tuple[str,
                 row=1,
                 col=i,
             )
-    fig.update_yaxes(autorange="reversed", title_text="Depth", col=1)
+    fig.update_yaxes(autorange="reversed", title_text=depth_col, col=1)
     fig.update_layout(
         height=height,
         legend=dict(orientation="h", yanchor="bottom", y=1.06),
@@ -95,7 +98,7 @@ def depth_track_figure(df: pd.DataFrame, tracks: list[tuple[str, list[tuple[str,
 
 
 # ---------------------------------------------------------------------------
-# Sidebar: data input & calculation settings
+# Sidebar: units, data input & calculation settings
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
@@ -106,34 +109,69 @@ with st.sidebar:
     )
     st.divider()
 
-    st.header("1. Data input")
+    st.header("1. Units")
+    unit_system = st.selectbox(
+        "Input/Output Units",
+        mc.UNIT_SYSTEMS,
+        index=0,
+        help="Controls how the uploaded data is interpreted AND how results are displayed.",
+    )
+    expected = mc.INPUT_UNITS[unit_system]
+    st.caption(
+        "Expected input units — "
+        + " · ".join(f"{curve}: {unit}" for curve, unit in expected.items())
+    )
+
+    st.divider()
+    st.header("2. Data input")
     uploaded = st.file_uploader(
         "Upload well log data (CSV / Excel)",
         type=["csv", "txt", "xls", "xlsx"],
-        help="One row per depth sample. Required curves: DEPTH, GR, RHOB, DTCO, DTSM. POROSITY is optional.",
+        help="One row per depth sample. Required curves: DEPTH/MD, GR, RHOB, DTCO, DTSM. "
+        "POROSITY is optional. Unit rows under the header and -999.25/-9999 nulls are handled automatically.",
     )
     if uploaded is not None:
         try:
-            st.session_state.raw_df = mc.load_data(uploaded)
+            st.session_state.raw_df, st.session_state.load_messages = mc.load_data(uploaded)
             st.session_state.data_source = f"📄 {uploaded.name}"
         except ValueError as exc:
             st.error(str(exc))
 
     if st.button("🧪 Load Sample Data", use_container_width=True):
-        st.session_state.raw_df = mc.generate_sample_data()
-        st.session_state.data_source = "🧪 Synthetic sample well (2500-3000 m)"
+        st.session_state.raw_df = mc.generate_sample_data(unit_system=unit_system)
+        st.session_state.data_source = f"🧪 Synthetic sample well (2500-3000 m, {unit_system.lower()})"
+        st.session_state.load_messages = []
+
+    st.download_button(
+        "⬇️ Download Example File",
+        data=mc.sample_csv_bytes(unit_system=unit_system),
+        file_name="mem_example_data.csv",
+        mime="text/csv",
+        use_container_width=True,
+        help=f"Clean sample CSV (MD, GR, RHOB, DTCO, DTSM, POROSITY) in {unit_system.lower()}.",
+    )
 
     if st.session_state.data_source:
         st.success(f"Loaded: {st.session_state.data_source}")
+    for msg in st.session_state.load_messages:
+        st.info(msg)
+    if st.session_state.raw_df is not None:
+        undetected = mc.missing_required_curves(list(st.session_state.raw_df.columns))
+        if undetected:
+            st.warning(
+                "Could not auto-detect column(s) for: "
+                + ", ".join(undetected)
+                + ". Map them manually below or check your file."
+            )
 
     st.divider()
-    st.header("2. Column mapping")
+    st.header("3. Column mapping")
     column_map: dict[str, str] = {}
     if st.session_state.raw_df is not None:
         options = ["-- not mapped --"] + list(st.session_state.raw_df.columns)
         for curve in mc.ALL_CURVES:
             required = curve in mc.REQUIRED_CURVES
-            label = f"{curve} {'(required)' if required else '(optional)'}"
+            label = f"{curve} [{expected[curve]}] {'(required)' if required else '(optional)'}"
             choice = st.selectbox(
                 label,
                 options,
@@ -145,7 +183,7 @@ with st.sidebar:
         st.info("Load data first to map columns.")
 
     st.divider()
-    st.header("3. Static properties")
+    st.header("4. Static properties")
     method_label = st.selectbox(
         "Dynamic → static YME correlation",
         list(mc.STATIC_YME_METHODS.keys()),
@@ -176,7 +214,7 @@ with st.sidebar:
         custom_b = st.number_input("Custom intercept b (Mpsi)", value=0.0, format="%.4f")
 
     st.divider()
-    st.header("4. Rock strength")
+    st.header("5. Rock strength")
     tstr_multiplier = st.slider(
         "Tensile strength / UCS ratio",
         min_value=0.05,
@@ -200,6 +238,9 @@ with st.sidebar:
 
 if run_clicked:
     try:
+        st.session_state.unit_warnings = mc.check_unit_sanity(
+            st.session_state.raw_df, column_map, unit_system
+        )
         with st.spinner("Computing dynamic, static and strength properties..."):
             results = mc.run_full_workflow(
                 data=st.session_state.raw_df,
@@ -210,6 +251,7 @@ if run_clicked:
                 tstr_multiplier=tstr_multiplier,
                 custom_a=custom_a,
                 custom_b=custom_b,
+                unit_system=unit_system,
             )
         st.session_state.results_df = results
         st.session_state.qc_summary, st.session_state.qc_flags = mc.run_qc(results)
@@ -229,8 +271,20 @@ st.markdown(
     "dynamic elastic properties → static conversion → rock strength, with built-in QC."
 )
 
+for warning in st.session_state.unit_warnings:
+    st.warning(f"⚠️ Unit check: {warning}")
+
 results = st.session_state.results_df
 flags = st.session_state.qc_flags
+
+# Convert canonical results into the selected display unit system.
+# N maps canonical column names -> display names (e.g. YME_DYN_GPA -> 'YME_DYN [Mpsi]').
+if results is not None:
+    disp, N = mc.display_results(results, unit_system)
+    flags_disp = flags.rename(columns=N) if flags is not None else None
+    DEPTH = N["DEPTH"]
+else:
+    disp, N, flags_disp, DEPTH = None, {}, None, None
 
 tab_input, tab_dyn, tab_sta, tab_strength, tab_qc, tab_viz = st.tabs(
     ["📥 Data Input", "🌊 Dynamic Props", "🧱 Static Props", "💪 Rock Strength", "✅ QC Report", "📊 Visualizations"]
@@ -240,18 +294,26 @@ tab_input, tab_dyn, tab_sta, tab_strength, tab_qc, tab_viz = st.tabs(
 with tab_input:
     if st.session_state.raw_df is None:
         st.info("👈 Upload a CSV/Excel file or click **Load Sample Data** in the sidebar to get started.")
+        unit_rows = "\n".join(
+            f"| {curve} | {desc} | {expected[curve]} |"
+            for curve, desc in [
+                ("DEPTH", "Measured depth (MD)"),
+                ("GR", "Gamma ray"),
+                ("RHOB", "Bulk density"),
+                ("DTCO", "Compressional slowness"),
+                ("DTSM", "Shear slowness"),
+                ("POROSITY", "Total/effective porosity (optional)"),
+            ]
+        )
         st.markdown(
-            """
-            **Expected input columns** (any names — map them in the sidebar):
+            f"""
+            **Expected input columns for {unit_system}** (any names — map them in the sidebar):
 
             | Curve | Description | Unit |
             |---|---|---|
-            | DEPTH | Measured depth | m or ft |
-            | GR | Gamma ray | gAPI |
-            | RHOB | Bulk density | g/cc |
-            | DTCO | Compressional slowness | µs/ft |
-            | DTSM | Shear slowness | µs/ft |
-            | POROSITY | Total/effective porosity (optional) | fraction |
+            {unit_rows}
+
+            Use **Download Example File** in the sidebar to get a correctly formatted template.
             """
         )
     else:
@@ -272,18 +334,19 @@ with tab_dyn:
     if results is None:
         st.info("Run the calculation from the sidebar to see dynamic elastic properties.")
     else:
-        st.subheader("Dynamic elastic properties (from DTCO / DTSM / RHOB)")
-        st.caption("Slowness converted to velocity (v = 304800/Δt), moduli computed by geomechpy in Pa and reported in GPa.")
-        dyn_cols = ["DEPTH", "VP_MS", "VS_MS", "VPVS", "YME_DYN_GPA", "PR_DYN", "K_DYN_GPA", "G_DYN_GPA", "LAME_DYN_GPA", "M_DYN_GPA"]
-        st.dataframe(style_flags(results, flags, dyn_cols), use_container_width=True, height=420)
+        st.subheader(f"Dynamic elastic properties ({unit_system})")
+        st.caption("Slowness converted to velocity (v = 304800/Δt[µs/ft]), moduli computed by geomechpy.")
+        dyn_cols = [DEPTH] + [N[c] for c in ["VP_MS", "VS_MS", "VPVS", "YME_DYN_GPA", "PR_DYN", "K_DYN_GPA", "G_DYN_GPA", "LAME_DYN_GPA", "M_DYN_GPA"]]
+        st.dataframe(style_flags(disp, flags_disp, dyn_cols), use_container_width=True, height=420)
         st.plotly_chart(
             depth_track_figure(
-                results,
+                disp,
+                DEPTH,
                 [
-                    ("Velocities (m/s)", [("VP_MS", "Vp"), ("VS_MS", "Vs")]),
-                    ("Young's mod. (GPa)", [("YME_DYN_GPA", "E dyn")]),
-                    ("Poisson's ratio", [("PR_DYN", "ν dyn")]),
-                    ("Bulk / Shear (GPa)", [("K_DYN_GPA", "K dyn"), ("G_DYN_GPA", "G dyn")]),
+                    (f"Velocities ({mc.display_unit('VP_MS', unit_system)})", [(N["VP_MS"], "Vp"), (N["VS_MS"], "Vs")]),
+                    (f"Young's mod. ({mc.display_unit('YME_DYN_GPA', unit_system)})", [(N["YME_DYN_GPA"], "E dyn")]),
+                    ("Poisson's ratio", [(N["PR_DYN"], "ν dyn")]),
+                    (f"Bulk / Shear ({mc.display_unit('K_DYN_GPA', unit_system)})", [(N["K_DYN_GPA"], "K dyn"), (N["G_DYN_GPA"], "G dyn")]),
                 ],
                 height=650,
             ),
@@ -295,16 +358,17 @@ with tab_sta:
     if results is None:
         st.info("Run the calculation from the sidebar to see static elastic properties.")
     else:
-        st.subheader("Static elastic properties")
+        st.subheader(f"Static elastic properties ({unit_system})")
         st.caption(f"Method: **{method_label}** · calibration multiplier ×{calibration_multiplier:.2f} · PR multiplier ×{pr_multiplier:.2f}")
-        sta_cols = ["DEPTH", "YME_DYN_GPA", "YME_STA_GPA", "YME_STA_MPSI", "PR_DYN", "PR_STA"]
-        st.dataframe(style_flags(results, flags, sta_cols), use_container_width=True, height=420)
+        sta_cols = [DEPTH] + [N[c] for c in ["YME_DYN_GPA", "YME_STA_GPA", "PR_DYN", "PR_STA"]]
+        st.dataframe(style_flags(disp, flags_disp, sta_cols), use_container_width=True, height=420)
 
         fig = depth_track_figure(
-            results,
+            disp,
+            DEPTH,
             [
-                ("Young's modulus (GPa)", [("YME_DYN_GPA", "E dynamic"), ("YME_STA_GPA", "E static")]),
-                ("Poisson's ratio", [("PR_DYN", "ν dynamic"), ("PR_STA", "ν static")]),
+                (f"Young's modulus ({mc.display_unit('YME_STA_GPA', unit_system)})", [(N["YME_DYN_GPA"], "E dynamic"), (N["YME_STA_GPA"], "E static")]),
+                ("Poisson's ratio", [(N["PR_DYN"], "ν dynamic"), (N["PR_STA"], "ν static")]),
             ],
             height=650,
         )
@@ -315,20 +379,21 @@ with tab_strength:
     if results is None:
         st.info("Run the calculation from the sidebar to see rock strength results.")
     else:
-        st.subheader("Rock strength")
+        st.subheader(f"Rock strength ({unit_system})")
         st.caption(
             "UCS from Plumb (1994) static-YME correlation · "
             f"TSTR = {tstr_multiplier:.2f} × UCS · friction angle from Lal (1999) shale correlation."
         )
-        str_cols = ["DEPTH", "UCS_PSI", "UCS_MPA", "TSTR_PSI", "TSTR_MPA", "FANG_DEG"]
-        st.dataframe(style_flags(results, flags, str_cols), use_container_width=True, height=420)
+        str_cols = [DEPTH] + [N[c] for c in ["UCS_MPA", "TSTR_MPA", "FANG_DEG"]]
+        st.dataframe(style_flags(disp, flags_disp, str_cols), use_container_width=True, height=420)
         st.plotly_chart(
             depth_track_figure(
-                results,
+                disp,
+                DEPTH,
                 [
-                    ("UCS (MPa)", [("UCS_MPA", "UCS")]),
-                    ("Tensile strength (MPa)", [("TSTR_MPA", "TSTR")]),
-                    ("Friction angle (°)", [("FANG_DEG", "FANG")]),
+                    (f"UCS ({mc.display_unit('UCS_MPA', unit_system)})", [(N["UCS_MPA"], "UCS")]),
+                    (f"Tensile strength ({mc.display_unit('TSTR_MPA', unit_system)})", [(N["TSTR_MPA"], "TSTR")]),
+                    ("Friction angle (°)", [(N["FANG_DEG"], "FANG")]),
                 ],
                 height=650,
             ),
@@ -344,7 +409,11 @@ with tab_qc:
         status = mc.qc_status(qc)
         badge = {"PASS": "🟢 PASS", "WARNING": "🟡 WARNING", "FAIL": "🔴 FAIL"}[status]
         st.subheader(f"QC report — overall status: {badge}")
-        st.caption("Each curve is checked against standard geomechanical ranges. LOW/HIGH = outside range, MISSING = null/non-numeric.")
+        st.caption(
+            "Each curve is checked against standard geomechanical ranges "
+            "(expressed in the units shown in the Unit column). "
+            "LOW/HIGH = outside range, MISSING = null/non-numeric."
+        )
 
         def _pct_color(v):
             if v >= 95:
@@ -359,13 +428,13 @@ with tab_qc:
             hide_index=True,
         )
 
-        flagged_cols = [c for c in flags.columns if (flags[c] != "OK").any()]
-        if flagged_cols:
+        flagged_canonical = [c for c in flags.columns if (flags[c] != "OK").any()]
+        if flagged_canonical:
             st.markdown("**Flagged samples** (rows where at least one curve is out of range or missing):")
-            bad_rows = flags[flagged_cols].ne("OK").any(axis=1)
-            show_cols = ["DEPTH"] + flagged_cols
+            bad_rows = flags[flagged_canonical].ne("OK").any(axis=1)
+            show_cols = [DEPTH] + [N[c] for c in flagged_canonical if c in N]
             st.dataframe(
-                style_flags(results.loc[bad_rows], flags.loc[bad_rows], show_cols),
+                style_flags(disp.loc[bad_rows], flags_disp.loc[bad_rows], show_cols),
                 use_container_width=True,
                 height=350,
             )
@@ -377,18 +446,19 @@ with tab_viz:
     if results is None:
         st.info("Run the calculation from the sidebar to see the composite MEM plot.")
     else:
-        st.subheader("Composite MEM display")
+        st.subheader(f"Composite MEM display ({unit_system})")
         st.plotly_chart(
             depth_track_figure(
-                results,
+                disp,
+                DEPTH,
                 [
-                    ("GR (gAPI)", [("GR", "GR")]),
-                    ("RHOB (g/cc)", [("RHOB", "RHOB")]),
-                    ("Slowness (µs/ft)", [("DTCO", "DTCO"), ("DTSM", "DTSM")]),
-                    ("E (GPa)", [("YME_DYN_GPA", "E dyn"), ("YME_STA_GPA", "E sta")]),
-                    ("ν (-)", [("PR_DYN", "ν dyn"), ("PR_STA", "ν sta")]),
-                    ("UCS / TSTR (MPa)", [("UCS_MPA", "UCS"), ("TSTR_MPA", "TSTR")]),
-                    ("FANG (°)", [("FANG_DEG", "FANG")]),
+                    ("GR (gAPI)", [(N["GR"], "GR")]),
+                    (f"RHOB ({mc.display_unit('RHOB', unit_system)})", [(N["RHOB"], "RHOB")]),
+                    (f"Slowness ({mc.display_unit('DTCO', unit_system)})", [(N["DTCO"], "DTCO"), (N["DTSM"], "DTSM")]),
+                    (f"E ({mc.display_unit('YME_DYN_GPA', unit_system)})", [(N["YME_DYN_GPA"], "E dyn"), (N["YME_STA_GPA"], "E sta")]),
+                    ("ν (-)", [(N["PR_DYN"], "ν dyn"), (N["PR_STA"], "ν sta")]),
+                    (f"UCS / TSTR ({mc.display_unit('UCS_MPA', unit_system)})", [(N["UCS_MPA"], "UCS"), (N["TSTR_MPA"], "TSTR")]),
+                    ("FANG (°)", [(N["FANG_DEG"], "FANG")]),
                 ],
                 height=800,
             ),
@@ -396,17 +466,17 @@ with tab_viz:
         )
 
         st.subheader("Crossplot explorer")
-        numeric_cols = [c for c in results.columns if pd.api.types.is_numeric_dtype(results[c])]
+        numeric_cols = [c for c in disp.columns if pd.api.types.is_numeric_dtype(disp[c])]
         c1, c2, c3 = st.columns(3)
-        x_col = c1.selectbox("X axis", numeric_cols, index=numeric_cols.index("YME_DYN_GPA") if "YME_DYN_GPA" in numeric_cols else 0)
-        y_col = c2.selectbox("Y axis", numeric_cols, index=numeric_cols.index("YME_STA_GPA") if "YME_STA_GPA" in numeric_cols else 0)
-        color_col = c3.selectbox("Color by", numeric_cols, index=numeric_cols.index("GR") if "GR" in numeric_cols else 0)
+        x_col = c1.selectbox("X axis", numeric_cols, index=numeric_cols.index(N["YME_DYN_GPA"]) if N.get("YME_DYN_GPA") in numeric_cols else 0)
+        y_col = c2.selectbox("Y axis", numeric_cols, index=numeric_cols.index(N["YME_STA_GPA"]) if N.get("YME_STA_GPA") in numeric_cols else 0)
+        color_col = c3.selectbox("Color by", numeric_cols, index=numeric_cols.index(N["GR"]) if N.get("GR") in numeric_cols else 0)
         xfig = go.Figure(
             go.Scatter(
-                x=results[x_col],
-                y=results[y_col],
+                x=disp[x_col],
+                y=disp[y_col],
                 mode="markers",
-                marker=dict(color=results[color_col], colorscale="Viridis", showscale=True, colorbar_title=color_col),
+                marker=dict(color=disp[color_col], colorscale="Viridis", showscale=True, colorbar_title=color_col),
                 hovertemplate=f"{x_col}: %{{x:.3f}}<br>{y_col}: %{{y:.3f}}<extra></extra>",
             )
         )
@@ -420,8 +490,8 @@ with tab_viz:
 if results is not None:
     st.divider()
     st.download_button(
-        "⬇️ Download results as CSV",
-        data=mc.results_to_csv_bytes(results),
+        f"⬇️ Download results as CSV ({unit_system})",
+        data=mc.results_to_csv_bytes(disp),
         file_name="mem_results.csv",
         mime="text/csv",
         type="primary",
