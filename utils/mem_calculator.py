@@ -6,8 +6,13 @@ All geomechanics calculations are delegated to the geomechpy library:
     - geomechpy.static_elastic_properties -> dynamic-to-static conversion
     - geomechpy.rock_strength             -> UCS / TSTR / friction angle
 
-This module only handles unit conversions, dataframe plumbing, QC flagging
-and sample-data generation for the Streamlit front end.
+This module only handles unit systems and conversions, dataframe plumbing,
+QC flagging and sample-data generation for the Streamlit front end.
+
+Canonical internal units (everything is converted to these before
+calculation, regardless of the selected input unit system):
+    DTCO/DTSM us/ft · RHOB g/cc · velocities m/s · moduli GPa ·
+    strength MPa · friction angle deg
 """
 
 from __future__ import annotations
@@ -27,29 +32,157 @@ from geomechpy.static_elastic_properties import StaticElasticPropertiesConverter
 # ---------------------------------------------------------------------------
 
 FT_TO_M_US = 304800.0          # us/ft slowness -> m/s velocity: v = 304800 / dt
+M_PER_FT = 0.3048              # us/ft = us/m * 0.3048 ; ft/s = m/s / 0.3048
 PA_TO_GPA = 1.0e-9             # Pascal -> GigaPascal
 PA_TO_PSI = 1.0 / 6894.757293  # Pascal -> psi
 PA_TO_MPSI = PA_TO_PSI * 1e-6  # Pascal -> Mega-psi
 PSI_TO_MPA = 6894.757293e-6    # psi -> MPa
+MPA_TO_PSI = 1.0 / PSI_TO_MPA  # MPa -> psi
+GPA_TO_MPSI = PA_TO_MPSI / PA_TO_GPA  # GPa -> Mpsi (~0.145)
 GCC_TO_KGM3 = 1000.0           # g/cc -> kg/m3
+
+# Common well-log null sentinels replaced with NaN on load.
+NULL_SENTINELS = [-999.0, -999.25, -9999.0, -9999.25, -99999.0, 9999.0]
 
 # Curves the app can map. POROSITY is optional unless the Morales method is used.
 REQUIRED_CURVES = ["DEPTH", "GR", "RHOB", "DTCO", "DTSM"]
 OPTIONAL_CURVES = ["POROSITY"]
 ALL_CURVES = REQUIRED_CURVES + OPTIONAL_CURVES
 
-# Static Young's modulus correlations exposed in the UI.
-# input_unit tells us which unit the geomechpy function expects for dynamic YME.
-STATIC_YME_METHODS = {
-    "Bradford (power law, North Sea sandstone)": {"key": "bradford", "input_unit": "Mpsi"},
-    "Najibi (power law, Iranian carbonates)": {"key": "najibi", "input_unit": "Mpsi"},
-    "Fuller (power law, sandstone/shale)": {"key": "fuller", "input_unit": "GPa"},
-    "Morales (porosity-dependent, sandstone)": {"key": "morales", "input_unit": "Mpsi"},
-    "Custom power law (y = a*x^b)": {"key": "custom_power", "input_unit": "Mpsi"},
-    "Custom linear law (y = a*x + b)": {"key": "custom_linear", "input_unit": "Mpsi"},
+# ---------------------------------------------------------------------------
+# Unit systems
+# ---------------------------------------------------------------------------
+
+OILFIELD = "Oilfield Units"
+METRIC = "Metric Units"
+UNIT_SYSTEMS = [OILFIELD, METRIC]
+
+# Expected INPUT units per system (shown in the UI and used to convert to
+# canonical units before calculation).
+INPUT_UNITS = {
+    OILFIELD: {"DEPTH": "m", "GR": "gAPI", "RHOB": "g/cc", "DTCO": "µs/ft", "DTSM": "µs/ft", "POROSITY": "frac"},
+    METRIC: {"DEPTH": "m", "GR": "gAPI", "RHOB": "kg/m³", "DTCO": "µs/m", "DTSM": "µs/m", "POROSITY": "frac"},
 }
 
-# QC validation ranges: column -> (min, max, unit) using typical log/MEM limits.
+# Display spec: canonical column -> (display name, (oilfield unit, factor),
+# (metric unit, factor)). Factor converts FROM the canonical value TO the
+# displayed value. Order here defines display column order.
+DISPLAY_SPEC: dict[str, tuple[str, tuple[str, float], tuple[str, float]]] = {
+    "DEPTH": ("MD", ("m", 1.0), ("m", 1.0)),
+    "GR": ("GR", ("gAPI", 1.0), ("gAPI", 1.0)),
+    "RHOB": ("RHOB", ("g/cc", 1.0), ("kg/m³", GCC_TO_KGM3)),
+    "DTCO": ("DTCO", ("µs/ft", 1.0), ("µs/m", 1.0 / M_PER_FT)),
+    "DTSM": ("DTSM", ("µs/ft", 1.0), ("µs/m", 1.0 / M_PER_FT)),
+    "POROSITY": ("POROSITY", ("frac", 1.0), ("frac", 1.0)),
+    "VP_MS": ("VP", ("ft/s", 1.0 / M_PER_FT), ("m/s", 1.0)),
+    "VS_MS": ("VS", ("ft/s", 1.0 / M_PER_FT), ("m/s", 1.0)),
+    "VPVS": ("VP/VS", ("-", 1.0), ("-", 1.0)),
+    "YME_DYN_GPA": ("YME_DYN", ("Mpsi", GPA_TO_MPSI), ("GPa", 1.0)),
+    "PR_DYN": ("PR_DYN", ("-", 1.0), ("-", 1.0)),
+    "K_DYN_GPA": ("K_DYN", ("Mpsi", GPA_TO_MPSI), ("GPa", 1.0)),
+    "G_DYN_GPA": ("G_DYN", ("Mpsi", GPA_TO_MPSI), ("GPa", 1.0)),
+    "LAME_DYN_GPA": ("LAME_DYN", ("Mpsi", GPA_TO_MPSI), ("GPa", 1.0)),
+    "M_DYN_GPA": ("M_DYN", ("Mpsi", GPA_TO_MPSI), ("GPa", 1.0)),
+    "YME_STA_GPA": ("YME_STA", ("Mpsi", GPA_TO_MPSI), ("GPa", 1.0)),
+    "PR_STA": ("PR_STA", ("-", 1.0), ("-", 1.0)),
+    "UCS_MPA": ("UCS", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
+    "TSTR_MPA": ("TSTR", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
+    "FANG_DEG": ("FANG", ("deg", 1.0), ("deg", 1.0)),
+}
+
+
+def _spec(canonical: str, unit_system: str) -> tuple[str, str, float]:
+    """(display base name, unit string, factor from canonical) for a column."""
+    name, oilfield, metric = DISPLAY_SPEC[canonical]
+    unit, factor = oilfield if unit_system == OILFIELD else metric
+    return name, unit, factor
+
+
+def display_name(canonical: str, unit_system: str) -> str:
+    """Display column header, e.g. 'YME_DYN [Mpsi]'."""
+    name, unit, _ = _spec(canonical, unit_system)
+    return f"{name} [{unit}]" if unit not in ("", "-") else name
+
+
+def display_unit(canonical: str, unit_system: str) -> str:
+    """Unit string for the selected system, e.g. 'GPa' or 'Mpsi'."""
+    return _spec(canonical, unit_system)[1]
+
+
+def display_results(df: pd.DataFrame, unit_system: str) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Convert a canonical results frame into the selected unit system.
+
+    Returns:
+        disp: converted DataFrame with unit-labelled column names.
+        names: mapping canonical column -> display column name (for plots
+               and for renaming QC flag columns).
+    """
+    disp = pd.DataFrame(index=df.index)
+    names: dict[str, str] = {}
+    for canonical in DISPLAY_SPEC:
+        if canonical not in df.columns:
+            continue
+        _, _, factor = _spec(canonical, unit_system)
+        label = display_name(canonical, unit_system)
+        disp[label] = pd.to_numeric(df[canonical], errors="coerce") * factor
+        names[canonical] = label
+    return disp, names
+
+
+def normalize_input_units(df: pd.DataFrame, unit_system: str) -> pd.DataFrame:
+    """Convert mapped input columns (canonical names) into canonical units.
+
+    Oilfield input is already canonical. Metric input: DT µs/m -> µs/ft,
+    RHOB kg/m³ -> g/cc.
+    """
+    out = df.copy()
+    if unit_system == METRIC:
+        for col in ("DTCO", "DTSM"):
+            if col in out.columns:
+                out[col] = out[col] * M_PER_FT
+        if "RHOB" in out.columns:
+            out["RHOB"] = out["RHOB"] / GCC_TO_KGM3
+    return out
+
+
+def check_unit_sanity(data: pd.DataFrame, column_map: dict[str, str], unit_system: str) -> list[str]:
+    """Heuristic warnings when the data magnitudes contradict the selected units."""
+    warnings: list[str] = []
+
+    def _median(curve: str) -> float:
+        src = column_map.get(curve)
+        if not src or src not in data.columns:
+            return float("nan")
+        return float(pd.to_numeric(data[src], errors="coerce").median())
+
+    dt = _median("DTCO")
+    rhob = _median("RHOB")
+    if unit_system == OILFIELD:
+        if np.isfinite(dt) and dt > 250:
+            warnings.append(
+                f"Median DTCO is {dt:.0f} — that looks like µs/m, but Oilfield Units expects µs/ft. "
+                "Consider switching to Metric Units."
+            )
+        if np.isfinite(rhob) and rhob > 100:
+            warnings.append(
+                f"Median RHOB is {rhob:.0f} — that looks like kg/m³, but Oilfield Units expects g/cc. "
+                "Consider switching to Metric Units."
+            )
+    else:
+        if np.isfinite(dt) and dt < 130:
+            warnings.append(
+                f"Median DTCO is {dt:.0f} — that looks like µs/ft, but Metric Units expects µs/m. "
+                "Consider switching to Oilfield Units."
+            )
+        if np.isfinite(rhob) and rhob < 10:
+            warnings.append(
+                f"Median RHOB is {rhob:.2f} — that looks like g/cc, but Metric Units expects kg/m³. "
+                "Consider switching to Oilfield Units."
+            )
+    return warnings
+
+
+# QC validation ranges in CANONICAL units: column -> (min, max, unit).
 QC_RANGES = {
     "GR": (0.0, 250.0, "gAPI"),
     "RHOB": (1.5, 3.2, "g/cc"),
@@ -66,20 +199,96 @@ QC_RANGES = {
     "FANG_DEG": (10.0, 55.0, "deg"),
 }
 
+# Static Young's modulus correlations exposed in the UI.
+# input_unit tells us which unit the geomechpy function expects for dynamic YME.
+STATIC_YME_METHODS = {
+    "Bradford (power law, North Sea sandstone)": {"key": "bradford", "input_unit": "Mpsi"},
+    "Najibi (power law, Iranian carbonates)": {"key": "najibi", "input_unit": "Mpsi"},
+    "Fuller (power law, sandstone/shale)": {"key": "fuller", "input_unit": "GPa"},
+    "Morales (porosity-dependent, sandstone)": {"key": "morales", "input_unit": "Mpsi"},
+    "Custom power law (y = a*x^b)": {"key": "custom_power", "input_unit": "Mpsi"},
+    "Custom linear law (y = a*x + b)": {"key": "custom_linear", "input_unit": "Mpsi"},
+}
+
 
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_data(uploaded_file) -> pd.DataFrame:
-    """Read an uploaded CSV or Excel file into a DataFrame.
+def _drop_unit_rows(df: pd.DataFrame, max_rows: int = 3) -> tuple[pd.DataFrame, int]:
+    """Drop leading rows that hold unit strings instead of data.
 
+    A leading row is treated as a unit row when it is non-numeric in at least
+    half of the columns whose remaining values are mostly numeric
+    (e.g. a 'M | GAPI | G/CC | US/F' line under the header).
+    """
+    dropped = 0
+    while len(df) > 1 and dropped < max_rows:
+        first = df.iloc[0]
+        body = df.iloc[1:]
+        checkable = 0
+        non_numeric = 0
+        for col in df.columns:
+            body_numeric_share = pd.to_numeric(body[col], errors="coerce").notna().mean()
+            if body_numeric_share >= 0.6:
+                checkable += 1
+                first_val = pd.to_numeric(pd.Series([first[col]]), errors="coerce").iloc[0]
+                if pd.isna(first_val):
+                    non_numeric += 1
+        if checkable and non_numeric / checkable >= 0.5:
+            df = df.iloc[1:].reset_index(drop=True)
+            dropped += 1
+        else:
+            break
+    return df, dropped
+
+
+def clean_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Robust cleanup of a freshly parsed log table.
+
+    - drops leading unit rows,
+    - coerces mostly-numeric columns to numeric (bad cells -> NaN),
+    - replaces well-log null sentinels (-999.25, -9999, ...) and ±inf with NaN.
+
+    Returns the cleaned frame and a list of informational messages.
+    """
+    messages: list[str] = []
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    df, dropped = _drop_unit_rows(df)
+    if dropped:
+        messages.append(f"Skipped {dropped} leading unit/header row(s) that contained no data.")
+
+    n_nulls = 0
+    for col in df.columns:
+        numeric = pd.to_numeric(df[col], errors="coerce")
+        if numeric.notna().mean() >= 0.5:  # mostly numeric -> treat as a log curve
+            sentinel_mask = numeric.isin(NULL_SENTINELS) | ~np.isfinite(numeric.fillna(0.0))
+            n_nulls += int(sentinel_mask.sum())
+            numeric[sentinel_mask] = np.nan
+            df[col] = numeric
+    if n_nulls:
+        messages.append(f"Replaced {n_nulls} null sentinel value(s) (e.g. -999.25 / -9999) with NaN.")
+
+    df = df.dropna(how="all").reset_index(drop=True)
+    return df, messages
+
+
+def load_data(uploaded_file) -> tuple[pd.DataFrame, list[str]]:
+    """Read an uploaded CSV or Excel file and clean it up.
+
+    Returns (dataframe, informational messages).
     Raises ValueError with a user-friendly message on failure.
     """
     name = uploaded_file.name.lower()
     try:
-        if name.endswith(".csv") or name.endswith(".txt"):
-            df = pd.read_csv(uploaded_file)
+        if name.endswith((".csv", ".txt")):
+            df = pd.read_csv(uploaded_file, skip_blank_lines=True)
+            # Single-column result usually means a non-comma delimiter: re-sniff.
+            if df.shape[1] == 1:
+                uploaded_file.seek(0)
+                df = pd.read_csv(uploaded_file, sep=None, engine="python", skip_blank_lines=True)
         elif name.endswith((".xls", ".xlsx")):
             df = pd.read_excel(uploaded_file)
         else:
@@ -93,7 +302,11 @@ def load_data(uploaded_file) -> pd.DataFrame:
         raise ValueError("The uploaded file contains no rows.")
     if df.shape[1] < 2:
         raise ValueError("The uploaded file needs at least a depth column and one log curve.")
-    return df
+
+    df, messages = clean_dataframe(df)
+    if df.empty:
+        raise ValueError("No data rows remained after cleaning the file.")
+    return df, messages
 
 
 def guess_column(curve: str, columns: list[str]) -> int:
@@ -117,15 +330,21 @@ def guess_column(curve: str, columns: list[str]) -> int:
     return 0
 
 
+def missing_required_curves(columns: list[str]) -> list[str]:
+    """Required curves that could not be auto-detected in the given columns."""
+    return [c for c in REQUIRED_CURVES if guess_column(c, columns) == 0]
+
+
 # ---------------------------------------------------------------------------
 # Sample data
 # ---------------------------------------------------------------------------
 
-def generate_sample_data(n_points: int = 201, seed: int = 42) -> pd.DataFrame:
+def generate_sample_data(n_points: int = 201, seed: int = 42, unit_system: str = OILFIELD) -> pd.DataFrame:
     """Generate a synthetic sand/shale well-log interval (2500-3000 m MD).
 
-    Values are geologically plausible so all downstream calculations
-    produce sensible magnitudes.
+    Values are geologically plausible so all downstream calculations produce
+    sensible magnitudes. Output columns: MD, GR, RHOB, DTCO, DTSM, POROSITY,
+    expressed in the requested unit system.
     """
     rng = np.random.default_rng(seed)
     depth = np.linspace(2500.0, 3000.0, n_points)
@@ -137,14 +356,19 @@ def generate_sample_data(n_points: int = 201, seed: int = 42) -> pd.DataFrame:
     compaction = (depth - 2500.0) / 500.0  # 0 -> 1 over the interval
 
     gr = 25.0 + 110.0 * vsh + rng.normal(0, 4.0, n_points)
-    rhob = 2.30 + 0.25 * compaction + 0.12 * vsh + rng.normal(0, 0.02, n_points)
-    dtco = 95.0 - 25.0 * compaction + 18.0 * vsh + rng.normal(0, 1.5, n_points)
-    dtsm = dtco * (1.65 + 0.25 * vsh) + rng.normal(0, 3.0, n_points)
+    rhob = 2.30 + 0.25 * compaction + 0.12 * vsh + rng.normal(0, 0.02, n_points)  # g/cc
+    dtco = 95.0 - 25.0 * compaction + 18.0 * vsh + rng.normal(0, 1.5, n_points)   # us/ft
+    dtsm = dtco * (1.65 + 0.25 * vsh) + rng.normal(0, 3.0, n_points)              # us/ft
     porosity = np.clip(0.28 - 0.12 * compaction - 0.08 * vsh + rng.normal(0, 0.01, n_points), 0.03, 0.35)
+
+    if unit_system == METRIC:
+        dtco = dtco / M_PER_FT       # us/ft -> us/m
+        dtsm = dtsm / M_PER_FT
+        rhob = rhob * GCC_TO_KGM3    # g/cc -> kg/m3
 
     return pd.DataFrame(
         {
-            "DEPTH": np.round(depth, 2),
+            "MD": np.round(depth, 2),
             "GR": np.round(gr, 2),
             "RHOB": np.round(rhob, 3),
             "DTCO": np.round(dtco, 2),
@@ -154,12 +378,19 @@ def generate_sample_data(n_points: int = 201, seed: int = 42) -> pd.DataFrame:
     )
 
 
+def sample_csv_bytes(unit_system: str = OILFIELD) -> bytes:
+    """Example CSV for the 'Download Example File' button."""
+    buffer = io.StringIO()
+    generate_sample_data(unit_system=unit_system).to_csv(buffer, index=False)
+    return buffer.getvalue().encode("utf-8")
+
+
 # ---------------------------------------------------------------------------
 # Dynamic elastic properties (geomechpy.elastic_properties)
 # ---------------------------------------------------------------------------
 
 def compute_dynamic_properties(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute dynamic elastic properties from DTCO/DTSM/RHOB.
+    """Compute dynamic elastic properties from DTCO/DTSM/RHOB (canonical units).
 
     Unit handling:
         DTCO, DTSM : us/ft  -> Vp, Vs in m/s   (v = 304800 / dt)
@@ -210,7 +441,7 @@ def compute_dynamic_properties(df: pd.DataFrame) -> pd.DataFrame:
         out["VPVS"] = np.where(vs > 0, vp / vs, np.nan)
     for k, v in cols.items():
         out[k] = v
-    out["YME_DYN_MPSI"] = out["YME_DYN_GPA"] / (PA_TO_GPA / PA_TO_MPSI)
+    out["YME_DYN_MPSI"] = out["YME_DYN_GPA"] * GPA_TO_MPSI
     return out
 
 
@@ -285,10 +516,10 @@ def compute_static_properties(
     yme_sta_native = yme_sta_native * calibration_multiplier
     if method["input_unit"] == "GPa":
         out["YME_STA_GPA"] = yme_sta_native
-        out["YME_STA_MPSI"] = yme_sta_native * (PA_TO_MPSI / PA_TO_GPA)
+        out["YME_STA_MPSI"] = yme_sta_native * GPA_TO_MPSI
     else:
         out["YME_STA_MPSI"] = yme_sta_native
-        out["YME_STA_GPA"] = yme_sta_native * (PA_TO_GPA / PA_TO_MPSI)
+        out["YME_STA_GPA"] = yme_sta_native / GPA_TO_MPSI
 
     # Static Poisson's ratio via geomechpy constant-multiplier law.
     pr_dyn = out["PR_DYN"].to_numpy(dtype=float)
@@ -353,7 +584,7 @@ def compute_rock_strength(df: pd.DataFrame, tstr_multiplier: float = 0.15) -> pd
 # ---------------------------------------------------------------------------
 
 def run_qc(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Validate every known column against QC_RANGES.
+    """Validate every known column against QC_RANGES (canonical units).
 
     Returns:
         qc_summary: one row per checked curve with counts and % in range.
@@ -420,8 +651,10 @@ def run_full_workflow(
     tstr_multiplier: float,
     custom_a: float = 0.5,
     custom_b: float = 1.0,
+    unit_system: str = OILFIELD,
 ) -> pd.DataFrame:
-    """Rename mapped columns to standard mnemonics and run all three modules."""
+    """Rename mapped columns to standard mnemonics, convert the input to
+    canonical units and run all three geomechpy modules."""
     missing = [c for c in REQUIRED_CURVES if not column_map.get(c)]
     if missing:
         raise ValueError(f"Missing required column mapping(s): {', '.join(missing)}")
@@ -430,7 +663,10 @@ def run_full_workflow(
     df = data[[c for c in rename]].rename(columns=rename).copy()
     for col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+        df.loc[df[col].isin(NULL_SENTINELS), col] = np.nan  # safety net
     df = df.sort_values("DEPTH").reset_index(drop=True)
+
+    df = normalize_input_units(df, unit_system)
 
     df = compute_dynamic_properties(df)
     df = compute_static_properties(
