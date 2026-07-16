@@ -22,6 +22,7 @@ import math
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 
 from geomechpy.elastic_properties import ElasticPropertiesConverter
 from geomechpy.rock_strength import RockStrengthPropertiesConverter
@@ -90,9 +91,6 @@ DISPLAY_SPEC: dict[str, tuple[str, tuple[str, float], tuple[str, float]]] = {
     "FANG_DEG": ("FANG", ("deg", 1.0), ("deg", 1.0)),
 }
 
-def get_unit_systems():
-    """Return list of available unit systems for the UI."""
-    return UNIT_SYSTEMS
 
 def _spec(canonical: str, unit_system: str) -> tuple[str, str, float]:
     """(display base name, unit string, factor from canonical) for a column."""
@@ -689,3 +687,221 @@ def results_to_csv_bytes(df: pd.DataFrame) -> bytes:
     buffer = io.StringIO()
     df.to_csv(buffer, index=False, float_format="%.4f")
     return buffer.getvalue().encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Sensitivity analysis (Tornado plot)
+# ---------------------------------------------------------------------------
+
+# Canonical result columns selectable as tornado targets (display order).
+TORNADO_TARGETS = [
+    "YME_STA_GPA",
+    "UCS_MPA",
+    "TSTR_MPA",
+    "PR_STA",
+    "YME_DYN_GPA",
+    "PR_DYN",
+    "FANG_DEG",
+]
+
+# Input curves perturbed one at a time, plus the static YME calibration multiplier.
+TORNADO_INPUT_CURVES = ["GR", "RHOB", "DTCO", "DTSM", "POROSITY"]
+STATIC_MULT_PARAM = "Static YME multiplier"
+TORNADO_PARAMS = TORNADO_INPUT_CURVES + [STATIC_MULT_PARAM]
+
+
+def run_tornado_analysis(
+    data: pd.DataFrame,
+    column_map: dict[str, str],
+    target_output: str,
+    variation_pct: float = 10.0,
+    *,
+    method_label: str,
+    calibration_multiplier: float = 1.0,
+    pr_multiplier: float = 1.0,
+    tstr_multiplier: float = 0.15,
+    custom_a: float = 0.5,
+    custom_b: float = 1.0,
+    unit_system: str = OILFIELD,
+) -> tuple[pd.DataFrame, float, list[str]]:
+    """One-at-a-time sensitivity of a target output to the main inputs.
+
+    The current data is the base case. Each parameter in TORNADO_PARAMS is
+    varied by ±variation_pct while everything else is held fixed, and the
+    full workflow is recomputed. The compared statistic is the depth-averaged
+    (NaN-ignoring mean) value of the target column, in canonical units.
+
+    Returns:
+        tornado: DataFrame with one row per varied parameter:
+                 Parameter, low, high (target means at -/+ variation),
+                 pct_low, pct_high (% change vs base), swing (|high - low|),
+                 sorted by swing descending.
+        base_value: base-case target mean (canonical units).
+        skipped: parameters that could not be varied (unmapped column or
+                 failed recomputation).
+    """
+    if target_output not in DISPLAY_SPEC:
+        raise ValueError(f"Unknown target output: {target_output}")
+
+    workflow_kwargs = dict(
+        column_map=column_map,
+        method_label=method_label,
+        pr_multiplier=pr_multiplier,
+        tstr_multiplier=tstr_multiplier,
+        custom_a=custom_a,
+        custom_b=custom_b,
+        unit_system=unit_system,
+    )
+
+    def _target_mean(frame: pd.DataFrame, cal_multiplier: float) -> float:
+        res = run_full_workflow(frame, calibration_multiplier=cal_multiplier, **workflow_kwargs)
+        if target_output not in res.columns:
+            raise ValueError(f"Target '{target_output}' was not produced by the workflow.")
+        return float(np.nanmean(pd.to_numeric(res[target_output], errors="coerce")))
+
+    base_value = _target_mean(data, calibration_multiplier)
+    if not np.isfinite(base_value):
+        raise ValueError(
+            "The base case produced no valid values for the selected target — "
+            "check the column mapping and QC report."
+        )
+
+    frac = float(variation_pct) / 100.0
+    rows: list[dict] = []
+    skipped: list[str] = []
+
+    for param in TORNADO_PARAMS:
+        try:
+            if param == STATIC_MULT_PARAM:
+                low = _target_mean(data, calibration_multiplier * (1.0 - frac))
+                high = _target_mean(data, calibration_multiplier * (1.0 + frac))
+            else:
+                src = column_map.get(param)
+                if not src or src not in data.columns:
+                    skipped.append(param)
+                    continue
+                values = pd.to_numeric(data[src], errors="coerce")
+                lo_frame = data.copy()
+                lo_frame[src] = values * (1.0 - frac)
+                hi_frame = data.copy()
+                hi_frame[src] = values * (1.0 + frac)
+                low = _target_mean(lo_frame, calibration_multiplier)
+                high = _target_mean(hi_frame, calibration_multiplier)
+        except (ValueError, ZeroDivisionError, OverflowError):
+            skipped.append(param)
+            continue
+
+        rows.append(
+            {
+                "Parameter": param,
+                "low": low,
+                "high": high,
+                "pct_low": 100.0 * (low - base_value) / base_value if base_value else np.nan,
+                "pct_high": 100.0 * (high - base_value) / base_value if base_value else np.nan,
+            }
+        )
+
+    tornado = pd.DataFrame(rows)
+    if tornado.empty:
+        raise ValueError("No input parameters could be varied — check the column mapping.")
+    tornado["swing"] = (tornado["high"] - tornado["low"]).abs()
+    tornado = tornado.sort_values("swing", ascending=False).reset_index(drop=True)
+    return tornado, base_value, skipped
+
+
+def generate_tornado_plot(
+    df: pd.DataFrame,
+    column_map: dict[str, str],
+    target_output: str,
+    variation_pct: float = 10.0,
+    **settings,
+) -> tuple[go.Figure, pd.DataFrame, float, list[str]]:
+    """Run the tornado analysis and build the Plotly figure.
+
+    settings are forwarded to run_tornado_analysis (method_label,
+    calibration_multiplier, pr_multiplier, tstr_multiplier, custom_a,
+    custom_b, unit_system). Values are converted to the selected unit
+    system for display.
+
+    Returns:
+        fig: horizontal-bar tornado chart, largest swing on top.
+        table: per-parameter results in display units (for st.dataframe).
+        base_display: base-case target value in display units.
+        skipped: parameters that could not be varied.
+    """
+    unit_system = settings.get("unit_system", OILFIELD)
+    tornado, base_value, skipped = run_tornado_analysis(
+        df, column_map, target_output, variation_pct, **settings
+    )
+
+    _, _, factor = _spec(target_output, unit_system)
+    target_label = display_name(target_output, unit_system)
+    base_display = base_value * factor
+
+    t = tornado.copy()
+    t["low"] = t["low"] * factor
+    t["high"] = t["high"] * factor
+    t["swing"] = t["swing"] * factor
+    t["delta_low"] = t["low"] - base_display
+    t["delta_high"] = t["high"] - base_display
+
+    # Plotly draws category bars bottom-up: ascending swing puts the biggest on top.
+    plot = t.sort_values("swing", ascending=True)
+    pct = f"{variation_pct:g}"
+
+    fig = go.Figure()
+    fig.add_bar(
+        y=plot["Parameter"],
+        x=plot["delta_low"],
+        base=base_display,
+        orientation="h",
+        name=f"Input -{pct}%",
+        marker_color="#d95f02",
+        customdata=np.stack([plot["low"], plot["pct_low"]], axis=-1),
+        hovertemplate=(
+            "%{y} -" + pct + "%<br>"
+            + target_label + ": %{customdata[0]:.3f} (%{customdata[1]:+.2f}% vs base)"
+            "<extra></extra>"
+        ),
+    )
+    fig.add_bar(
+        y=plot["Parameter"],
+        x=plot["delta_high"],
+        base=base_display,
+        orientation="h",
+        name=f"Input +{pct}%",
+        marker_color="#1f77b4",
+        customdata=np.stack([plot["high"], plot["pct_high"]], axis=-1),
+        hovertemplate=(
+            "%{y} +" + pct + "%<br>"
+            + target_label + ": %{customdata[0]:.3f} (%{customdata[1]:+.2f}% vs base)"
+            "<extra></extra>"
+        ),
+    )
+    fig.add_vline(
+        x=base_display,
+        line_dash="dash",
+        line_color="gray",
+        annotation_text=f"base = {base_display:.3f}",
+        annotation_position="top",
+    )
+    fig.update_layout(
+        barmode="overlay",
+        title=f"Tornado plot — sensitivity of {target_label} to ±{pct}% input variation",
+        xaxis_title=f"Depth-averaged {target_label}",
+        yaxis_title="Varied input parameter",
+        height=max(360, 90 * len(plot) + 140),
+        legend=dict(orientation="h", yanchor="bottom", y=1.04),
+        margin=dict(t=110, b=40),
+    )
+
+    table = t[["Parameter", "low", "high", "pct_low", "pct_high", "swing"]].rename(
+        columns={
+            "low": f"Target @ -{pct}%",
+            "high": f"Target @ +{pct}%",
+            "pct_low": "Δ% @ low",
+            "pct_high": "Δ% @ high",
+            "swing": f"Swing [{display_unit(target_output, unit_system)}]",
+        }
+    )
+    return fig, table, base_display, skipped
