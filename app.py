@@ -36,6 +36,7 @@ for key, default in {
     "data_source": None,   # label shown in the sidebar
     "load_messages": [],   # info messages from the data cleaner
     "unit_warnings": [],   # unit sanity warnings from the last run
+    "tornado": None,       # last tornado analysis (fig, table, meta)
 }.items():
     st.session_state.setdefault(key, default)
 
@@ -286,8 +287,16 @@ if results is not None:
 else:
     disp, N, flags_disp, DEPTH = None, {}, None, None
 
-tab_input, tab_dyn, tab_sta, tab_strength, tab_qc, tab_viz = st.tabs(
-    ["📥 Data Input", "🌊 Dynamic Props", "🧱 Static Props", "💪 Rock Strength", "✅ QC Report", "📊 Visualizations"]
+tab_input, tab_dyn, tab_sta, tab_strength, tab_qc, tab_viz, tab_tornado = st.tabs(
+    [
+        "📥 Data Input",
+        "🌊 Dynamic Props",
+        "🧱 Static Props",
+        "💪 Rock Strength",
+        "✅ QC Report",
+        "📊 Visualizations",
+        "🌪️ Sensitivity Analysis (Tornado Plot)",
+    ]
 )
 
 # --- Tab 1: Data input ------------------------------------------------------
@@ -482,6 +491,102 @@ with tab_viz:
         )
         xfig.update_layout(xaxis_title=x_col, yaxis_title=y_col, height=520)
         st.plotly_chart(xfig, use_container_width=True)
+
+# --- Tab 7: Sensitivity analysis (Tornado plot) --------------------------------
+with tab_tornado:
+    st.subheader("Sensitivity Analysis (Tornado Plot)")
+    st.markdown(
+        """
+        The tornado plot shows **which input has the biggest impact on a chosen output**.
+        Using the currently loaded data as the *base case*, each input parameter
+        (GR, RHOB, DTCO, DTSM, POROSITY and the static YME calibration multiplier)
+        is varied **one at a time** by the selected percentage while everything else is
+        held fixed, and the full MEM workflow is recomputed. Bars show how the
+        **depth-averaged** target value moves relative to the base case — the longer the
+        bar, the more sensitive the result is to that input.
+
+        Notes: GR is carried through the workflow but does not enter any calculation
+        (QC only), so its bar is expectedly zero. POROSITY only affects results when the
+        Morales static correlation is selected. The analysis uses the current sidebar
+        settings (unit system, static method, multipliers).
+        """
+    )
+    if st.session_state.raw_df is None:
+        st.info("👈 Load data in the sidebar first — the tornado plot needs a base case.")
+    else:
+        c1, c2 = st.columns(2)
+        target_options = [mc.display_name(t, unit_system) for t in mc.TORNADO_TARGETS]
+        target_label_sel = c1.selectbox(
+            "Target Output",
+            target_options,
+            index=0,
+            key="tornado_target",
+            help="Result whose sensitivity is analysed (depth-averaged mean).",
+        )
+        target_canonical = mc.TORNADO_TARGETS[target_options.index(target_label_sel)]
+        variation_pct = c2.select_slider(
+            "Variation Range",
+            options=[5, 10, 20],
+            value=10,
+            format_func=lambda v: f"±{v}%",
+            key="tornado_pct",
+        )
+
+        if st.button("🌪️ Generate Tornado Plot", type="primary", key="tornado_btn"):
+            try:
+                with st.spinner("Recomputing the workflow for each input variation..."):
+                    fig, table, base_disp, skipped = mc.generate_tornado_plot(
+                        st.session_state.raw_df,
+                        column_map,
+                        target_canonical,
+                        variation_pct,
+                        method_label=method_label,
+                        calibration_multiplier=calibration_multiplier,
+                        pr_multiplier=pr_multiplier,
+                        tstr_multiplier=tstr_multiplier,
+                        custom_a=custom_a,
+                        custom_b=custom_b,
+                        unit_system=unit_system,
+                    )
+                st.session_state.tornado = {
+                    "fig": fig,
+                    "table": table,
+                    "base": base_disp,
+                    "skipped": skipped,
+                    "target_label": mc.display_name(target_canonical, unit_system),
+                    "pct": variation_pct,
+                    "units": unit_system,
+                    "method": method_label,
+                }
+            except ValueError as exc:
+                st.session_state.tornado = None
+                st.error(f"⚠️ {exc}")
+            except Exception as exc:  # keep the app alive on unexpected input
+                st.session_state.tornado = None
+                st.error(f"Unexpected error during sensitivity analysis: {exc}")
+
+        tornado = st.session_state.tornado
+        if tornado is not None:
+            st.metric(
+                f"Base case — depth-averaged {tornado['target_label']}",
+                f"{tornado['base']:.3f}",
+            )
+            st.plotly_chart(tornado["fig"], use_container_width=True)
+            st.markdown("**Per-parameter results** (sorted by impact):")
+            st.dataframe(
+                tornado["table"].style.format(precision=3),
+                use_container_width=True,
+                hide_index=True,
+            )
+            if tornado["skipped"]:
+                st.info(
+                    "Skipped (not mapped or could not be recomputed): "
+                    + ", ".join(tornado["skipped"])
+                )
+            st.caption(
+                f"Generated with ±{tornado['pct']}% variation · {tornado['units']} · "
+                f"static method: {tornado['method']}. Re-generate after changing data or settings."
+            )
 
 # ---------------------------------------------------------------------------
 # Download
