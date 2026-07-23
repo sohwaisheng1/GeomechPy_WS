@@ -38,6 +38,34 @@ class RockStrengthPropertiesConverter:
         return float(ucs_plumb_generic)
 
     @staticmethod
+    def convert_dtco_to_ucs_mcnally_sandstone(dtco: float, output_unit: str = "MPa") -> float:
+        """
+        Convert compressional slowness (DTCO) to UCS using the McNally Sandstone correlation
+        Equation type: Exponential decay law (y = a*exp(b*x))
+        Applicable for: sandstone.
+        Reference: McNally, G.H., 1987. Estimation of coal measures rock strength using sonic
+           and neutron logs. Geoexploration, 24(4-5), pp.381-395.
+        Args:
+           dtco (float): Compressional slowness (sonic transit time). Unit: us/ft
+           output_unit (str): Desired output unit for UCS, either 'MPa' (native) or 'psi'.
+               Default: 'MPa'
+        Returns:
+           ucs_mcnally_sandstone: Unconfined compressive strength (UCS) from McNally Sandstone
+               correlation, converted to output_unit. Unit: MPa or psi
+        """
+        ucs_mpa = 1200.0 * math.exp(-0.036 * dtco)
+    
+        unit = output_unit.strip().lower()
+        if unit == "mpa":
+            ucs_mcnally_sandstone = ucs_mpa
+        elif unit == "psi":
+            ucs_mcnally_sandstone = ucs_mpa * 145.037737730209  # 1 MPa = 145.0377... psi
+        else:
+            raise ValueError(f"Unsupported output_unit: {output_unit!r}. Use 'MPa' or 'psi'.")
+    
+        return float(ucs_mcnally_sandstone)
+
+    @staticmethod
     def convert_ucs_to_tstr(ucs: float, multiplier: float = 0.15) -> float:
         """
         Convert UCS to tensile strength using a constant multiploer
