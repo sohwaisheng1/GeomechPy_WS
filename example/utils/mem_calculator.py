@@ -5,6 +5,10 @@ All geomechanics calculations are delegated to the geomechpy library:
     - geomechpy.elastic_properties        -> dynamic elastic properties
     - geomechpy.static_elastic_properties -> dynamic-to-static conversion
     - geomechpy.rock_strength             -> UCS / TSTR / friction angle
+    - geomechpy.overburden_stress         -> Sv (NEW)
+    - geomechpy.pore_pressure             -> Pp (NEW)
+    - geomechpy.stress_calculations       -> Shmin / SHmax / q-factor (NEW)
+    - geomechpy.wellbore_stability        -> breakout / breakdown (NEW)
 
 This module only handles unit systems and conversions, dataframe plumbing,
 QC flagging and sample-data generation for the Streamlit front end.
@@ -12,7 +16,7 @@ QC flagging and sample-data generation for the Streamlit front end.
 Canonical internal units (everything is converted to these before
 calculation, regardless of the selected input unit system):
     DTCO/DTSM us/ft · RHOB g/cc · velocities m/s · moduli GPa ·
-    strength MPa · friction angle deg
+    strength/stress MPa · mud weight g/cc · friction angle deg
 """
 
 from __future__ import annotations
@@ -25,8 +29,12 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from geomechpy.elastic_properties import ElasticPropertiesConverter
+from geomechpy.overburden_stress import OverburdenStressCalculation
+from geomechpy.pore_pressure import PorePressureCalculation
 from geomechpy.rock_strength import RockStrengthPropertiesConverter
 from geomechpy.static_elastic_properties import StaticElasticPropertiesConverter
+from geomechpy.stress_calculations import HorizontalStressesCalculation
+from geomechpy.wellbore_stability import WellboreStabilityCalculation
 
 # ---------------------------------------------------------------------------
 # Constants & unit conversion
@@ -41,6 +49,9 @@ PSI_TO_MPA = 6894.757293e-6    # psi -> MPa
 MPA_TO_PSI = 1.0 / PSI_TO_MPA  # MPa -> psi
 GPA_TO_MPSI = PA_TO_MPSI / PA_TO_GPA  # GPa -> Mpsi (~0.145)
 GCC_TO_KGM3 = 1000.0           # g/cc -> kg/m3
+M_TO_FT = 1.0 / M_PER_FT       # metres -> feet
+PSI_FT_PER_GCC = 0.4335        # hydrostatic gradient of 1 g/cc fluid in psi/ft
+PPG_PER_GCC = 8.3454           # mud weight: 1 g/cc = 8.3454 ppg
 
 # Common well-log null sentinels replaced with NaN on load.
 NULL_SENTINELS = [-999.0, -999.25, -9999.0, -9999.25, -99999.0, 9999.0]
@@ -69,7 +80,7 @@ INPUT_UNITS = {
 # (metric unit, factor)). Factor converts FROM the canonical value TO the
 # displayed value. Order here defines display column order.
 DISPLAY_SPEC: dict[str, tuple[str, tuple[str, float], tuple[str, float]]] = {
-    "DEPTH": ("MD", ("m", 1.0), ("m", 1.0)),
+    "DEPTH": ("MD", ("", 1.0), ("", 1.0)),  # passed through in the input depth unit
     "GR": ("GR", ("gAPI", 1.0), ("gAPI", 1.0)),
     "RHOB": ("RHOB", ("g/cc", 1.0), ("kg/m³", GCC_TO_KGM3)),
     "DTCO": ("DTCO", ("µs/ft", 1.0), ("µs/m", 1.0 / M_PER_FT)),
@@ -89,6 +100,19 @@ DISPLAY_SPEC: dict[str, tuple[str, tuple[str, float], tuple[str, float]]] = {
     "UCS_MPA": ("UCS", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
     "TSTR_MPA": ("TSTR", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
     "FANG_DEG": ("FANG", ("deg", 1.0), ("deg", 1.0)),
+    # --- NEW: stress profile & wellbore stability columns ---
+    "SV_MPA": ("SV", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
+    "PP_MPA": ("PP", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
+    "SHMIN_MPA": ("SHMIN", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
+    "SHMAX_MPA": ("SHMAX", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
+    "Q_FACTOR": ("Q_FACTOR", ("-", 1.0), ("-", 1.0)),
+    "SH_RATIO": ("SHMAX/SHMIN", ("-", 1.0), ("-", 1.0)),
+    "PW_BREAKOUT_MPA": ("PW_BREAKOUT", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
+    "PW_BREAKDOWN_MPA": ("PW_BREAKDOWN", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
+    "MW_PP_GCC": ("EMW_PP", ("ppg", PPG_PER_GCC), ("g/cc", 1.0)),
+    "MW_BREAKOUT_GCC": ("MW_BREAKOUT", ("ppg", PPG_PER_GCC), ("g/cc", 1.0)),
+    "MW_BREAKDOWN_GCC": ("MW_BREAKDOWN", ("ppg", PPG_PER_GCC), ("g/cc", 1.0)),
+    "MW_SV_GCC": ("EMW_SV", ("ppg", PPG_PER_GCC), ("g/cc", 1.0)),
 }
 
 
@@ -198,6 +222,23 @@ QC_RANGES = {
     "UCS_MPA": (1.0, 400.0, "MPa"),
     "TSTR_MPA": (0.1, 60.0, "MPa"),
     "FANG_DEG": (10.0, 55.0, "deg"),
+    # NEW: stress profile sanity ranges
+    "SV_MPA": (1.0, 300.0, "MPa"),
+    "PP_MPA": (0.5, 200.0, "MPa"),
+    "SHMIN_MPA": (0.5, 300.0, "MPa"),
+    "SHMAX_MPA": (0.5, 400.0, "MPa"),
+}
+
+# NEW: selectable rock strength methods. geomechpy.rock_strength currently
+# ships one correlation per property (Plumb UCS, Lal FANG); a constant-value
+# option is provided as a generic app-level fallback for calibration work.
+UCS_METHODS = {
+    "Plumb (1994) — from static YME [geomechpy]": "plumb",
+    "Constant value": "constant",
+}
+FANG_METHODS = {
+    "Lal (1999) — from DTCO, shale [geomechpy]": "lal",
+    "Constant value": "constant",
 }
 
 # Static Young's modulus correlations exposed in the UI.
@@ -537,11 +578,22 @@ def compute_static_properties(
 
 
 # ---------------------------------------------------------------------------
-# Rock strength (geomechpy.rock_strength)
+# Rock strength (geomechpy.rock_strength) — NEW: selectable methods
 # ---------------------------------------------------------------------------
 
-def compute_rock_strength(df: pd.DataFrame, tstr_multiplier: float = 0.15) -> pd.DataFrame:
-    """Compute UCS (Plumb), tensile strength and friction angle (Lal).
+def compute_rock_strength(
+    df: pd.DataFrame,
+    tstr_multiplier: float = 0.15,
+    ucs_method: str = "plumb",
+    fang_method: str = "lal",
+    ucs_constant_mpa: float = 50.0,
+    fang_constant_deg: float = 30.0,
+) -> pd.DataFrame:
+    """Compute UCS, tensile strength and friction angle with selectable methods.
+
+    ucs_method:  'plumb' (geomechpy Plumb 1994 from static YME) or 'constant'.
+    fang_method: 'lal' (geomechpy Lal 1999 from DTCO) or 'constant'.
+    TSTR is always tstr_multiplier x UCS (geomechpy constant-multiplier law).
 
     Unit handling:
         UCS  : static YME passed in MPa, geomechpy returns psi -> also report MPa.
@@ -563,10 +615,18 @@ def compute_rock_strength(df: pd.DataFrame, tstr_multiplier: float = 0.15) -> pd
     dtco = pd.to_numeric(out["DTCO"], errors="coerce").to_numpy(dtype=float)
 
     for i in range(n):
-        if np.isfinite(yme_sta[i]) and yme_sta[i] > 0:
+        # --- UCS ---
+        if ucs_method == "constant":
+            ucs_psi[i] = ucs_constant_mpa * MPA_TO_PSI
+        elif np.isfinite(yme_sta[i]) and yme_sta[i] > 0:
             ucs_psi[i] = conv.convert_yme_sta_to_ucs_plumb(yme_sta=float(yme_sta[i]))
+        # --- TSTR (always derived from UCS) ---
+        if np.isfinite(ucs_psi[i]):
             tstr_psi[i] = conv.convert_ucs_to_tstr(ucs=float(ucs_psi[i]), multiplier=tstr_multiplier)
-        if np.isfinite(dtco[i]) and dtco[i] > 0:
+        # --- FANG ---
+        if fang_method == "constant":
+            fang[i] = fang_constant_deg
+        elif np.isfinite(dtco[i]) and dtco[i] > 0:
             try:
                 fang[i] = conv.convert_friction_angle_lal(dtco=float(dtco[i]))
             except (ValueError, ZeroDivisionError):  # asin domain / dt=0 guards
@@ -640,6 +700,201 @@ def qc_status(qc_summary: pd.DataFrame) -> str:
 
 
 # ---------------------------------------------------------------------------
+# NEW: Overburden, pore pressure, horizontal stress & wellbore stability
+# (geomechpy.overburden_stress / pore_pressure / stress_calculations /
+#  wellbore_stability)
+# ---------------------------------------------------------------------------
+
+WELL_SETTINGS = ["Onshore", "Offshore"]
+SHMAX_METHODS = {
+    "Poroelastic (Thiercelin & Plumb, 1994) [geomechpy]": "poroelastic",
+    "Shmin × anisotropy multiplier [geomechpy]": "multiplier",
+}
+OVB_GRADIENT_SOURCES = {
+    "Constant lithostatic gradient": "constant",
+    "Derived from mean RHOB log": "density",
+}
+DEPTH_UNITS = ["m", "ft"]
+
+
+def default_stress_params() -> dict:
+    """Default parameter set for compute_stress_profile (all user-adjustable)."""
+    return {
+        "setting": "Onshore",            # 'Onshore' | 'Offshore'
+        "depth_unit": "m",               # unit of the DEPTH column ('m' | 'ft')
+        "air_gap": 0.0,                  # in depth_unit
+        "water_depth": 0.0,              # in depth_unit (offshore only)
+        "sea_gradient_psift": 0.47,      # sea water pressure gradient [psi/ft]
+        "ovb_source": "constant",        # 'constant' | 'density'
+        "ovb_gradient_psift": 1.05,      # lithostatic gradient [psi/ft]
+        "pp_gradient_psift": 0.47,       # formation pore pressure gradient [psi/ft]
+        "shmax_method": "poroelastic",   # 'poroelastic' | 'multiplier'
+        "shmax_multiplier": 1.1,         # used when shmax_method == 'multiplier'
+        "biot": 1.0,                     # Biot coefficient (constant law)
+        "ex": 0.0001,                    # tectonic strain term EX (poroelastic)
+        "ey": 0.009,                     # tectonic strain term EY (poroelastic)
+    }
+
+
+def compute_stress_profile(df: pd.DataFrame, params: dict) -> pd.DataFrame:
+    """NEW: full stress profile + vertical-well stability from geomechpy.
+
+    Steps (all library calls, per depth sample; MD is assumed ~ TVD, i.e. a
+    vertical well, which matches the analytical wellbore stability solution):
+      1. SV  : OverburdenStressCalculation onshore/offshore gradient method.
+               The lithostatic gradient is either a constant or derived from
+               the mean RHOB log (mean g/cc x 0.4335 psi/ft).
+      2. PP  : PorePressureCalculation onshore/offshore gradient method.
+      3. SHMIN/SHMAX : poroelastic equation (static PR + static YME [Mpsi],
+               Biot, tectonic strains EX/EY), or SHMAX = SHMIN x multiplier.
+               q-factor and SHMAX/SHMIN ratio from the library helpers.
+      4. Wellbore stability (vertical well): Mohr-Coulomb breakout pressure
+               and breakdown (fracture initiation) pressure, converted to
+               equivalent mud weights with the true vertical depth.
+
+    Canonical outputs: pressures/stresses in MPa, mud weights in g/cc.
+    Rows with missing prerequisites yield NaN instead of raising.
+    """
+    p = {**default_stress_params(), **(params or {})}
+    out = df.copy()
+    n = len(out)
+
+    depth = pd.to_numeric(out["DEPTH"], errors="coerce").to_numpy(dtype=float)
+    tvd_ft = depth * M_TO_FT if p["depth_unit"] == "m" else depth.copy()
+    to_ft = M_TO_FT if p["depth_unit"] == "m" else 1.0
+    air_gap_ft = float(p["air_gap"]) * to_ft
+    water_depth_ft = float(p["water_depth"]) * to_ft
+
+    # 1. Overburden gradient
+    ovb_gradient = float(p["ovb_gradient_psift"])
+    if p["ovb_source"] == "density" and "RHOB" in out.columns:
+        mean_rhob = float(pd.to_numeric(out["RHOB"], errors="coerce").mean())
+        if np.isfinite(mean_rhob) and mean_rhob > 0:
+            ovb_gradient = mean_rhob * PSI_FT_PER_GCC
+
+    sv_psi = np.full(n, np.nan)
+    pp_psi = np.full(n, np.nan)
+    for i in range(n):
+        if not np.isfinite(tvd_ft[i]) or tvd_ft[i] < 0:
+            continue
+        if p["setting"] == "Offshore":
+            sv_psi[i] = OverburdenStressCalculation.calculate_overburden_stress_offshore(
+                tvd=float(tvd_ft[i]),
+                lithostatic_gradient=ovb_gradient,
+                air_gap=air_gap_ft,
+                water_depth=water_depth_ft,
+                sea_water_pressure_gradient=float(p["sea_gradient_psift"]),
+            )
+            pp_psi[i] = PorePressureCalculation.calculate_pore_pressure_offshore(
+                tvd=float(tvd_ft[i]),
+                formation_pore_pressure_gradient=float(p["pp_gradient_psift"]),
+                air_gap=air_gap_ft,
+                water_depth=water_depth_ft,
+                sea_water_pressure_gradient=float(p["sea_gradient_psift"]),
+            )
+        else:
+            sv_psi[i] = OverburdenStressCalculation.calculate_overburden_stress_onshore(
+                tvd=float(tvd_ft[i]),
+                lithostatic_gradient=ovb_gradient,
+                air_gap=air_gap_ft,
+            )
+            pp_psi[i] = PorePressureCalculation.calculate_pore_pressure_onshore(
+                tvd=float(tvd_ft[i]),
+                formation_pore_pressure_gradient=float(p["pp_gradient_psift"]),
+                air_gap=air_gap_ft,
+            )
+
+    # 2. Horizontal stresses (poroelastic needs static PR + static YME in Mpsi)
+    pr_sta = pd.to_numeric(out.get("PR_STA"), errors="coerce").to_numpy(dtype=float) if "PR_STA" in out.columns else np.full(n, np.nan)
+    yme_sta_mpsi = pd.to_numeric(out.get("YME_STA_MPSI"), errors="coerce").to_numpy(dtype=float) if "YME_STA_MPSI" in out.columns else np.full(n, np.nan)
+
+    shmin_psi = np.full(n, np.nan)
+    shmax_psi = np.full(n, np.nan)
+    q_factor = np.full(n, np.nan)
+    sh_ratio = np.full(n, np.nan)
+    for i in range(n):
+        if not (np.isfinite(sv_psi[i]) and np.isfinite(pp_psi[i]) and np.isfinite(pr_sta[i]) and np.isfinite(yme_sta_mpsi[i])):
+            continue
+        if not (0.0 < pr_sta[i] < 0.5):
+            continue
+        try:
+            hs = HorizontalStressesCalculation.calculate_poroelastic_horizontal_stresses(
+                overburden_stress=float(sv_psi[i]),
+                pore_pressure=float(pp_psi[i]),
+                poisson_ratio=float(pr_sta[i]),
+                youngs_modulus=float(yme_sta_mpsi[i]),
+                biot_coefficient=float(p["biot"]),
+                EX=float(p["ex"]),
+                EY=float(p["ey"]),
+            )
+        except (ValueError, ZeroDivisionError, OverflowError):
+            continue
+        shmin_psi[i] = hs.shmin
+        if p["shmax_method"] == "multiplier":
+            shmax_psi[i] = HorizontalStressesCalculation.calculate_shmax_multiplier(
+                shmin=float(hs.shmin), shmax_multiplier=float(p["shmax_multiplier"])
+            )
+        else:
+            shmax_psi[i] = hs.shmax
+        try:
+            q_factor[i] = HorizontalStressesCalculation.calculate_stress_regime_q_factor(
+                sigv=float(sv_psi[i]), shmax=float(shmax_psi[i]), shmin=float(shmin_psi[i])
+            )
+            sh_ratio[i] = HorizontalStressesCalculation.calculate_horizontal_stress_ratio(
+                shmax=float(shmax_psi[i]), shmin=float(shmin_psi[i])
+            )
+        except (ValueError, ZeroDivisionError):
+            pass
+
+    # 3. Wellbore stability (vertical well, analytical)
+    ucs_psi = pd.to_numeric(out.get("UCS_PSI"), errors="coerce").to_numpy(dtype=float) if "UCS_PSI" in out.columns else np.full(n, np.nan)
+    tstr_psi = pd.to_numeric(out.get("TSTR_PSI"), errors="coerce").to_numpy(dtype=float) if "TSTR_PSI" in out.columns else np.full(n, np.nan)
+    fang = pd.to_numeric(out.get("FANG_DEG"), errors="coerce").to_numpy(dtype=float) if "FANG_DEG" in out.columns else np.full(n, np.nan)
+
+    pw_bo_psi = np.full(n, np.nan)   # breakout (shear failure) limit
+    pw_bd_psi = np.full(n, np.nan)   # breakdown (fracture initiation) limit
+    for i in range(n):
+        if not (np.isfinite(shmin_psi[i]) and np.isfinite(shmax_psi[i]) and np.isfinite(pp_psi[i])):
+            continue
+        if np.isfinite(tstr_psi[i]):
+            try:
+                pw_bd_psi[i] = WellboreStabilityCalculation.calculate_breakdown_calculation_vertical_well_analytical(
+                    shmax=float(shmax_psi[i]), shmin=float(shmin_psi[i]),
+                    pprs=float(pp_psi[i]), tstr=float(tstr_psi[i]),
+                )
+            except (ValueError, ZeroDivisionError, OverflowError):
+                pass
+        if np.isfinite(sv_psi[i]) and np.isfinite(ucs_psi[i]) and np.isfinite(fang[i]) and np.isfinite(pr_sta[i]):
+            try:
+                pw_bo_psi[i] = WellboreStabilityCalculation.calculate_breakout_calculation_vertical_well_mohr_coulomb_analytical(
+                    shmax=float(shmax_psi[i]), shmin=float(shmin_psi[i]),
+                    pprs=float(pp_psi[i]), overburden_stress=float(sv_psi[i]),
+                    ucs=float(ucs_psi[i]), fang=float(fang[i]), pr_sta=float(pr_sta[i]),
+                )
+            except (ValueError, ZeroDivisionError, OverflowError):
+                pass
+
+    # 4. Equivalent mud weights (g/cc canonical): EMW = P / (0.4335 * TVD_ft)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        denom = PSI_FT_PER_GCC * tvd_ft
+        mw = lambda pressure_psi: np.where(denom > 0, pressure_psi / denom, np.nan)  # noqa: E731
+        out["MW_PP_GCC"] = mw(pp_psi)
+        out["MW_SV_GCC"] = mw(sv_psi)
+        out["MW_BREAKOUT_GCC"] = mw(pw_bo_psi)
+        out["MW_BREAKDOWN_GCC"] = mw(pw_bd_psi)
+
+    out["SV_MPA"] = sv_psi * PSI_TO_MPA
+    out["PP_MPA"] = pp_psi * PSI_TO_MPA
+    out["SHMIN_MPA"] = shmin_psi * PSI_TO_MPA
+    out["SHMAX_MPA"] = shmax_psi * PSI_TO_MPA
+    out["Q_FACTOR"] = q_factor
+    out["SH_RATIO"] = sh_ratio
+    out["PW_BREAKOUT_MPA"] = pw_bo_psi * PSI_TO_MPA
+    out["PW_BREAKDOWN_MPA"] = pw_bd_psi * PSI_TO_MPA
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Full pipeline + export
 # ---------------------------------------------------------------------------
 
@@ -653,9 +908,16 @@ def run_full_workflow(
     custom_a: float = 0.5,
     custom_b: float = 1.0,
     unit_system: str = OILFIELD,
+    ucs_method: str = "plumb",
+    fang_method: str = "lal",
+    ucs_constant_mpa: float = 50.0,
+    fang_constant_deg: float = 30.0,
+    stress_params: dict | None = None,
 ) -> pd.DataFrame:
     """Rename mapped columns to standard mnemonics, convert the input to
-    canonical units and run all three geomechpy modules."""
+    canonical units and run the geomechpy modules: dynamic -> static ->
+    rock strength (selectable methods) -> optionally the full stress
+    profile + wellbore stability when stress_params is provided."""
     missing = [c for c in REQUIRED_CURVES if not column_map.get(c)]
     if missing:
         raise ValueError(f"Missing required column mapping(s): {', '.join(missing)}")
@@ -678,7 +940,16 @@ def run_full_workflow(
         custom_a=custom_a,
         custom_b=custom_b,
     )
-    df = compute_rock_strength(df, tstr_multiplier=tstr_multiplier)
+    df = compute_rock_strength(
+        df,
+        tstr_multiplier=tstr_multiplier,
+        ucs_method=ucs_method,
+        fang_method=fang_method,
+        ucs_constant_mpa=ucs_constant_mpa,
+        fang_constant_deg=fang_constant_deg,
+    )
+    if stress_params is not None:
+        df = compute_stress_profile(df, stress_params)
     return df
 
 
@@ -703,6 +974,13 @@ TORNADO_TARGETS = [
     "PR_DYN",
     "FANG_DEG",
 ]
+# NEW: additional targets available when the stress profile is computed.
+TORNADO_STRESS_TARGETS = [
+    "SHMIN_MPA",
+    "SHMAX_MPA",
+    "MW_BREAKOUT_GCC",
+    "MW_BREAKDOWN_GCC",
+]
 
 # Input curves perturbed one at a time, plus the static YME calibration multiplier.
 TORNADO_INPUT_CURVES = ["GR", "RHOB", "DTCO", "DTSM", "POROSITY"]
@@ -723,6 +1001,11 @@ def run_tornado_analysis(
     custom_a: float = 0.5,
     custom_b: float = 1.0,
     unit_system: str = OILFIELD,
+    ucs_method: str = "plumb",
+    fang_method: str = "lal",
+    ucs_constant_mpa: float = 50.0,
+    fang_constant_deg: float = 30.0,
+    stress_params: dict | None = None,
 ) -> tuple[pd.DataFrame, float, list[str]]:
     """One-at-a-time sensitivity of a target output to the main inputs.
 
@@ -751,6 +1034,11 @@ def run_tornado_analysis(
         custom_a=custom_a,
         custom_b=custom_b,
         unit_system=unit_system,
+        ucs_method=ucs_method,
+        fang_method=fang_method,
+        ucs_constant_mpa=ucs_constant_mpa,
+        fang_constant_deg=fang_constant_deg,
+        stress_params=stress_params,
     )
 
     def _target_mean(frame: pd.DataFrame, cal_multiplier: float) -> float:
@@ -820,8 +1108,9 @@ def generate_tornado_plot(
 
     settings are forwarded to run_tornado_analysis (method_label,
     calibration_multiplier, pr_multiplier, tstr_multiplier, custom_a,
-    custom_b, unit_system). Values are converted to the selected unit
-    system for display.
+    custom_b, unit_system, ucs_method, fang_method, ucs_constant_mpa,
+    fang_constant_deg, stress_params). Values are converted to the selected
+    unit system for display.
 
     Returns:
         fig: horizontal-bar tornado chart, largest swing on top.
@@ -905,4 +1194,3 @@ def generate_tornado_plot(
         }
     )
     return fig, table, base_display, skipped
-
