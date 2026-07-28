@@ -142,6 +142,28 @@ class RockStrengthPropertiesConverter:
         ]
 
     @staticmethod
+    def convert_dtco_to_ucs_mcnally_sandstone_array(
+        dtco: list[float], output_unit: str = "MPa"
+    ) -> list[float]:
+        """
+        Convert an array of compressional slowness (DTCO) values to UCS using the
+        McNally Sandstone correlation.
+        Args:
+           dtco (list[float]): Compressional slowness values Unit: us/ft
+           output_unit (str): Desired output unit for UCS, either 'MPa' (native) or 'psi'.
+               Default: 'MPa'
+        Returns:
+           ucs_mcnally_sandstone (list[float]): UCS values from McNally Sandstone
+               correlation, converted to output_unit. Unit: MPa or psi
+        """
+        return [
+            RockStrengthPropertiesConverter.convert_dtco_to_ucs_mcnally_sandstone(
+                dtco=value, output_unit=output_unit
+            )
+            for value in dtco
+        ]
+    
+    @staticmethod
     def convert_friction_angle_lal_array(dtco: list[float]) -> list[float]:
         """
         Convert an array of compressional slowness values to friction angles using Lal correlation.
