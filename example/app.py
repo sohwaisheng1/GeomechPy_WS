@@ -120,13 +120,19 @@ def mud_window_figure(disp: pd.DataFrame, depth_col: str, N: dict[str, str], uni
                 hovertemplate=f"Breakdown: %{{x:.3f}} {unit}<br>Depth: %{{y:.1f}}<extra></extra>",
             )
         )
-    for canonical, label, dash in [("MW_PP_GCC", "Pore pressure EMW", "dot"), ("MW_SV_GCC", "Overburden EMW", "dash")]:
+    extra_curves = [
+        ("MW_PP_GCC", "Pore pressure EMW", "dot", "gray"),
+        ("MW_SV_GCC", "Overburden EMW", "dash", "gray"),
+        # NEW: loss gradient = min principal stress (Sv, SHmax, Shmin) as EMW
+        ("MW_LOSS_GCC", "Loss gradient (min principal stress)", "dashdot", "#6f42c1"),
+    ]
+    for canonical, label, dash, color in extra_curves:
         col = N.get(canonical)
         if col in disp.columns:
             fig.add_trace(
                 go.Scatter(
                     x=disp[col], y=disp[depth_col], mode="lines", name=label,
-                    line=dict(dash=dash, color="gray"),
+                    line=dict(dash=dash, color=color),
                     hovertemplate=f"{label}: %{{x:.3f}} {unit}<br>Depth: %{{y:.1f}}<extra></extra>",
                 )
             )
@@ -271,7 +277,8 @@ with st.sidebar:
     ucs_method_label = st.selectbox(
         "UCS method",
         list(mc.UCS_METHODS.keys()),
-        help="UCS correlations from geomechpy.rock_strength, plus a constant-value fallback.",
+        help="All UCS correlations available in geomechpy.rock_strength (currently Plumb 1994), "
+        "plus a constant-value fallback for calibration.",
     )
     ucs_method = mc.UCS_METHODS[ucs_method_label]
     ucs_constant_mpa = 50.0
@@ -280,7 +287,8 @@ with st.sidebar:
     fang_method_label = st.selectbox(
         "Friction angle method",
         list(mc.FANG_METHODS.keys()),
-        help="FANG correlations from geomechpy.rock_strength, plus a constant-value fallback.",
+        help="All FANG correlations available in geomechpy.rock_strength (currently Lal 1999), "
+        "plus a constant-value fallback for calibration.",
     )
     fang_method = mc.FANG_METHODS[fang_method_label]
     fang_constant_deg = 30.0
@@ -439,6 +447,7 @@ else:
     tab_ovb,
     tab_hstress,
     tab_wbs,
+    tab_barrier,
     tab_tornado,
     tab_qc,
 ) = st.tabs(
@@ -450,6 +459,7 @@ else:
         "🏔️ Overburden & Pore Pressure",
         "↔️ Horizontal Stress",
         "🛢️ Wellbore Stability",
+        "🚧 Stress Barrier & Perforation Zones",
         "🌪️ Sensitivity (Tornado)",
         "✅ QC & Results",
     ]
@@ -649,7 +659,8 @@ with tab_wbs:
         st.caption(
             "Breakout limit: Mohr-Coulomb shear failure (Kirsch, analytical) — drilling below it risks breakouts. "
             "Breakdown limit: fracture initiation (Hubbert & Willis) — drilling above it risks losses. "
-            "The green band between them is the safe mud weight window."
+            "Loss gradient: minimum principal stress among Sv, SHmax and Shmin — exceeding it risks mud losses "
+            "into natural/reopened fractures. The green band is the safe mud weight window."
         )
 
         mw_unit = mc.display_unit("MW_BREAKOUT_GCC", unit_system)
@@ -667,7 +678,7 @@ with tab_wbs:
                 f"{n_closed} of {n_valid} depth samples — no safe static mud weight exists there."
             )
 
-        wbs_cols = [DEPTH] + [N[c] for c in ["PW_BREAKOUT_MPA", "PW_BREAKDOWN_MPA", "MW_BREAKOUT_GCC", "MW_BREAKDOWN_GCC", "MW_PP_GCC", "MW_SV_GCC"]]
+        wbs_cols = [DEPTH] + [N[c] for c in ["PW_BREAKOUT_MPA", "PW_BREAKDOWN_MPA", "LOSS_P_MPA", "MW_BREAKOUT_GCC", "MW_BREAKDOWN_GCC", "MW_LOSS_GCC", "MW_PP_GCC", "MW_SV_GCC"]]
         st.dataframe(style_flags(disp, flags_disp, wbs_cols), use_container_width=True, height=380)
         st.plotly_chart(mud_window_figure(disp, DEPTH, N, mw_unit), use_container_width=True)
         st.plotly_chart(
@@ -685,7 +696,157 @@ with tab_wbs:
             use_container_width=True,
         )
 
-# --- Tab 8: Sensitivity analysis (Tornado plot) --------------------------------
+# --- Tab 8: NEW — Stress Barrier & Perforation Zones ---------------------------
+with tab_barrier:
+    st.subheader("Stress Barrier Analysis & Perforation Zone Screening")
+    st.markdown(
+        """
+        Hydraulic fractures initiate where **Shmin is locally low** and stay contained when
+        intervals of **locally high Shmin (stress barriers)** exist above and below.
+        This analysis removes the depth trend from the computed Shmin profile and rates each
+        depth on the residual **stress contrast**:
+
+        - 🟥 **Barrier** — contrast above +threshold (frac containment interval)
+        - 🟩 **Good perforation zone** — low-stress target with barriers both above *and* below
+        - 🟨 **Moderate** — low-stress target with a barrier on one side only
+        - **Poor** — barriers themselves, neutral rock, or uncontained targets
+        """
+    )
+    if results is None:
+        st.info("Run the calculation from the sidebar first.")
+    elif not has_stress:
+        st.info("Enable **Compute stresses & mud weight window** in the sidebar and re-run.")
+    else:
+        p_unit = mc.display_unit("SHMIN_MPA", unit_system)
+        p_factor = mc.MPA_TO_PSI if unit_system == mc.OILFIELD else 1.0
+        c1, c2, c3 = st.columns(3)
+        if unit_system == mc.OILFIELD:
+            thr_disp = c1.slider(f"Stress contrast threshold ({p_unit})", 25, 500, 145, 5)
+            threshold_mpa = thr_disp / mc.MPA_TO_PSI
+        else:
+            thr_disp = c1.slider(f"Stress contrast threshold ({p_unit})", 0.2, 3.0, 1.0, 0.1)
+            threshold_mpa = thr_disp
+        search_window = c2.slider("Barrier search window (samples)", 5, 60, 20, 5,
+                                  help="How far above/below to look for a containing barrier.")
+        min_zone = c3.slider("Min. zone thickness (samples)", 2, 10, 3, 1)
+
+        try:
+            barrier = mc.analyze_stress_barriers(
+                results,
+                contrast_threshold_mpa=threshold_mpa,
+                search_window=search_window,
+                min_zone_samples=min_zone,
+            )
+        except ValueError as exc:
+            st.error(f"⚠️ {exc}")
+            barrier = None
+
+        if barrier is not None:
+            detail, zones, barriers = barrier["detail"], barrier["zones"], barrier["barriers"]
+            quality = detail["PERF_QUALITY"]
+            m1, m2, m3 = st.columns(3)
+            m1.metric("🟩 Good perforation zones", int((zones["Quality"] == "Good").sum()))
+            m2.metric("🟨 Moderate zones", int((zones["Quality"] == "Moderate").sum()))
+            m3.metric("🟥 Stress barriers", len(barriers))
+
+            # Stress profile with shaded barrier / perforation intervals
+            fig = go.Figure()
+            for canonical, name, color in [
+                ("SV_MPA", "Sv", "#6c757d"),
+                ("SHMAX_MPA", "SHmax", "#1f77b4"),
+                ("SHMIN_MPA", "Shmin", "#d95f02"),
+                ("PP_MPA", "Pp", "#2ca02c"),
+            ]:
+                fig.add_trace(
+                    go.Scatter(
+                        x=disp[N[canonical]], y=disp[DEPTH], mode="lines", name=name,
+                        line=dict(color=color),
+                        hovertemplate=f"{name}: %{{x:.2f}} {p_unit}<br>Depth: %{{y:.1f}}<extra></extra>",
+                    )
+                )
+            fig.add_trace(
+                go.Scatter(
+                    x=detail["TREND_MPA"] * p_factor, y=detail["DEPTH"], mode="lines",
+                    name="Shmin trend", line=dict(color="#d95f02", dash="dot", width=1),
+                    hovertemplate=f"Shmin trend: %{{x:.2f}} {p_unit}<br>Depth: %{{y:.1f}}<extra></extra>",
+                )
+            )
+            for _, z in barriers.iterrows():
+                fig.add_hrect(y0=z["Top"], y1=z["Base"], fillcolor="rgba(200, 35, 51, 0.15)", line_width=0)
+            for _, z in zones.iterrows():
+                color = "rgba(30, 126, 52, 0.22)" if z["Quality"] == "Good" else "rgba(211, 158, 0, 0.20)"
+                fig.add_hrect(y0=z["Top"], y1=z["Base"], fillcolor=color, line_width=0)
+            fig.update_yaxes(autorange="reversed", title_text=DEPTH)
+            fig.update_layout(
+                height=700,
+                xaxis_title=f"Stress ({p_unit})",
+                title="Stress profile — red bands = barriers, green = good zones, yellow = moderate",
+                legend=dict(orientation="h", yanchor="bottom", y=1.04),
+                margin=dict(t=90, b=40),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("**Recommended perforation intervals**")
+            if zones.empty:
+                st.info(
+                    "No qualifying intervals found — try lowering the contrast threshold or the "
+                    "minimum zone thickness, or widen the barrier search window."
+                )
+            else:
+                zdisp = zones.copy()
+                zdisp["Mean Shmin (MPa)"] = zdisp["Mean Shmin (MPa)"] * p_factor
+                zdisp["Mean contrast (MPa)"] = zdisp["Mean contrast (MPa)"] * p_factor
+                zdisp = zdisp.rename(
+                    columns={
+                        "Top": f"Top ({depth_unit})",
+                        "Base": f"Base ({depth_unit})",
+                        "Thickness": f"Thickness ({depth_unit})",
+                        "Mean Shmin (MPa)": f"Mean Shmin ({p_unit})",
+                        "Mean contrast (MPa)": f"Mean contrast ({p_unit})",
+                    }
+                )
+                quality_css = {
+                    "Good": "background-color: #1e7e34; color: white",
+                    "Moderate": "background-color: #d39e00; color: black",
+                    "Poor": "background-color: #c82333; color: white",
+                }
+                st.dataframe(
+                    zdisp.style.map(lambda v: quality_css.get(v, ""), subset=["Quality"]).format(precision=2),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            with st.expander("Per-depth classification detail"):
+                ddisp = detail.copy()
+                for col in ("SHMIN_MPA", "TREND_MPA", "CONTRAST_MPA"):
+                    ddisp[col] = ddisp[col] * p_factor
+                ddisp = ddisp.rename(
+                    columns={
+                        "DEPTH": DEPTH,
+                        "SHMIN_MPA": f"SHMIN ({p_unit})",
+                        "TREND_MPA": f"Trend ({p_unit})",
+                        "CONTRAST_MPA": f"Contrast ({p_unit})",
+                    }
+                )
+                class_css = {
+                    "Barrier": "background-color: #c82333; color: white",
+                    "Target": "background-color: #1e7e34; color: white",
+                    "Neutral": "",
+                    "Good": "background-color: #1e7e34; color: white",
+                    "Moderate": "background-color: #d39e00; color: black",
+                    "Poor": "background-color: #6c757d; color: white",
+                }
+                st.dataframe(
+                    ddisp.style.map(lambda v: class_css.get(v, ""), subset=["CLASS", "PERF_QUALITY"]).format(precision=2),
+                    use_container_width=True,
+                    height=400,
+                )
+            st.caption(
+                "Screening heuristic based on relative Shmin contrast only — validate candidate zones "
+                "against reservoir quality, saturation and completion constraints before perforating."
+            )
+
+# --- Tab 9: Sensitivity analysis (Tornado plot) --------------------------------
 with tab_tornado:
     st.subheader("Sensitivity Analysis (Tornado Plot)")
     st.markdown(
@@ -778,7 +939,7 @@ with tab_tornado:
                 f"static method: {tornado['method']}. Re-generate after changing data or settings."
             )
 
-# --- Tab 9: QC & Results ------------------------------------------------------
+# --- Tab 10: QC & Results -----------------------------------------------------
 with tab_qc:
     if results is None or st.session_state.qc_summary is None:
         st.info("Run the calculation from the sidebar to generate the QC report.")
