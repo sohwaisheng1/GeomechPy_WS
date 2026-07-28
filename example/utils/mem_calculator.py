@@ -5,10 +5,6 @@ All geomechanics calculations are delegated to the geomechpy library:
     - geomechpy.elastic_properties        -> dynamic elastic properties
     - geomechpy.static_elastic_properties -> dynamic-to-static conversion
     - geomechpy.rock_strength             -> UCS / TSTR / friction angle
-    - geomechpy.overburden_stress         -> Sv (NEW)
-    - geomechpy.pore_pressure             -> Pp (NEW)
-    - geomechpy.stress_calculations       -> Shmin / SHmax / q-factor (NEW)
-    - geomechpy.wellbore_stability        -> breakout / breakdown (NEW)
 
 This module only handles unit systems and conversions, dataframe plumbing,
 QC flagging and sample-data generation for the Streamlit front end.
@@ -16,7 +12,7 @@ QC flagging and sample-data generation for the Streamlit front end.
 Canonical internal units (everything is converted to these before
 calculation, regardless of the selected input unit system):
     DTCO/DTSM us/ft · RHOB g/cc · velocities m/s · moduli GPa ·
-    strength/stress MPa · mud weight g/cc · friction angle deg
+    strength MPa · friction angle deg
 """
 
 from __future__ import annotations
@@ -109,6 +105,8 @@ DISPLAY_SPEC: dict[str, tuple[str, tuple[str, float], tuple[str, float]]] = {
     "SH_RATIO": ("SHMAX/SHMIN", ("-", 1.0), ("-", 1.0)),
     "PW_BREAKOUT_MPA": ("PW_BREAKOUT", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
     "PW_BREAKDOWN_MPA": ("PW_BREAKDOWN", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
+    "LOSS_P_MPA": ("LOSS_GRAD_P", ("psi", MPA_TO_PSI), ("MPa", 1.0)),  # NEW
+    "MW_LOSS_GCC": ("LOSS_GRADIENT", ("ppg", PPG_PER_GCC), ("g/cc", 1.0)),  # NEW
     "MW_PP_GCC": ("EMW_PP", ("ppg", PPG_PER_GCC), ("g/cc", 1.0)),
     "MW_BREAKOUT_GCC": ("MW_BREAKOUT", ("ppg", PPG_PER_GCC), ("g/cc", 1.0)),
     "MW_BREAKDOWN_GCC": ("MW_BREAKDOWN", ("ppg", PPG_PER_GCC), ("g/cc", 1.0)),
@@ -578,7 +576,7 @@ def compute_static_properties(
 
 
 # ---------------------------------------------------------------------------
-# Rock strength (geomechpy.rock_strength) — NEW: selectable methods
+# Rock strength (geomechpy.rock_strength)
 # ---------------------------------------------------------------------------
 
 def compute_rock_strength(
@@ -874,6 +872,10 @@ def compute_stress_profile(df: pd.DataFrame, params: dict) -> pd.DataFrame:
             except (ValueError, ZeroDivisionError, OverflowError):
                 pass
 
+    # NEW: loss gradient = minimum principal stress among Sv, SHmax, Shmin.
+    # NaN if any of the three is missing (a partial minimum would mislead).
+    loss_psi = np.minimum.reduce([sv_psi, shmax_psi, shmin_psi])
+
     # 4. Equivalent mud weights (g/cc canonical): EMW = P / (0.4335 * TVD_ft)
     with np.errstate(divide="ignore", invalid="ignore"):
         denom = PSI_FT_PER_GCC * tvd_ft
@@ -882,6 +884,7 @@ def compute_stress_profile(df: pd.DataFrame, params: dict) -> pd.DataFrame:
         out["MW_SV_GCC"] = mw(sv_psi)
         out["MW_BREAKOUT_GCC"] = mw(pw_bo_psi)
         out["MW_BREAKDOWN_GCC"] = mw(pw_bd_psi)
+        out["MW_LOSS_GCC"] = mw(loss_psi)
 
     out["SV_MPA"] = sv_psi * PSI_TO_MPA
     out["PP_MPA"] = pp_psi * PSI_TO_MPA
@@ -891,7 +894,145 @@ def compute_stress_profile(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     out["SH_RATIO"] = sh_ratio
     out["PW_BREAKOUT_MPA"] = pw_bo_psi * PSI_TO_MPA
     out["PW_BREAKDOWN_MPA"] = pw_bd_psi * PSI_TO_MPA
+    out["LOSS_P_MPA"] = loss_psi * PSI_TO_MPA
     return out
+
+
+# ---------------------------------------------------------------------------
+# NEW: Stress barrier analysis & perforation zone screening
+# ---------------------------------------------------------------------------
+
+PERF_QUALITIES = ["Good", "Moderate", "Poor"]
+
+
+def analyze_stress_barriers(
+    results: pd.DataFrame,
+    contrast_threshold_mpa: float = 1.0,
+    trend_window: int = 25,
+    search_window: int = 20,
+    min_zone_samples: int = 3,
+) -> dict:
+    """NEW: simple stress barrier analysis on the computed Shmin profile.
+
+    Rationale: hydraulic fractures initiate where Shmin is locally LOW and
+    stay contained when intervals of locally HIGH Shmin (stress barriers)
+    exist above and below. The analysis therefore:
+
+      1. Removes the depth trend from Shmin (centered rolling median over
+         trend_window samples) and works with the residual stress contrast.
+      2. Classifies each sample: contrast >= +threshold  -> 'Barrier',
+         contrast <= -threshold -> 'Target', otherwise 'Neutral'.
+      3. Rates each sample as a perforation candidate:
+           Good     : Target with a Barrier within search_window samples
+                      both above AND below (contained low-stress interval).
+           Moderate : Target with a Barrier on one side only.
+           Poor     : everything else (barriers themselves, neutral rock,
+                      uncontained targets).
+      4. Groups contiguous Good/Moderate samples into recommended
+         perforation intervals (at least min_zone_samples thick).
+
+    All stress values are canonical MPa; the caller converts for display.
+
+    Returns dict with:
+        detail   : per-depth DataFrame (DEPTH, SHMIN_MPA, TREND_MPA,
+                   CONTRAST_MPA, CLASS, PERF_QUALITY).
+        zones    : recommended perforation intervals (Top, Base, Thickness,
+                   Samples, Mean Shmin, Mean contrast, Quality).
+        barriers : barrier intervals (Top, Base, Thickness, Mean contrast).
+    """
+    if "SHMIN_MPA" not in results.columns:
+        raise ValueError("Stress barrier analysis needs the stress profile — enable stress computation and re-run.")
+
+    depth = pd.to_numeric(results["DEPTH"], errors="coerce")
+    shmin = pd.to_numeric(results["SHMIN_MPA"], errors="coerce")
+    valid = shmin.notna() & depth.notna()
+    if int(valid.sum()) < max(10, min_zone_samples):
+        raise ValueError("Not enough valid Shmin samples for a barrier analysis — check the QC report.")
+
+    trend = shmin.rolling(int(trend_window), center=True, min_periods=1).median()
+    contrast = shmin - trend
+
+    n = len(results)
+    cls = np.full(n, "N/A", dtype=object)
+    t = float(contrast_threshold_mpa)
+    c = contrast.to_numpy(dtype=float)
+    ok = valid.to_numpy()
+    cls[ok & (c >= t)] = "Barrier"
+    cls[ok & (c <= -t)] = "Target"
+    cls[ok & (np.abs(c) < t)] = "Neutral"
+
+    # Barrier presence within search_window samples above/below each sample.
+    is_barrier = (cls == "Barrier").astype(int)
+    above = np.zeros(n, dtype=bool)
+    below = np.zeros(n, dtype=bool)
+    w = int(search_window)
+    for i in range(n):
+        above[i] = is_barrier[max(0, i - w):i].any()
+        below[i] = is_barrier[i + 1:i + 1 + w].any()
+
+    quality = np.full(n, "Poor", dtype=object)
+    target = cls == "Target"
+    quality[target & above & below] = "Good"
+    quality[target & (above ^ below)] = "Moderate"
+    quality[~ok] = "N/A"
+
+    detail = pd.DataFrame(
+        {
+            "DEPTH": depth,
+            "SHMIN_MPA": shmin,
+            "TREND_MPA": trend,
+            "CONTRAST_MPA": contrast,
+            "CLASS": cls,
+            "PERF_QUALITY": quality,
+        }
+    )
+
+    def _intervals(mask: np.ndarray, min_len: int) -> list[tuple[int, int]]:
+        """Contiguous [start, end] index runs where mask is True."""
+        runs, start = [], None
+        for i in range(n):
+            if mask[i] and start is None:
+                start = i
+            elif not mask[i] and start is not None:
+                if i - start >= min_len:
+                    runs.append((start, i - 1))
+                start = None
+        if start is not None and n - start >= min_len:
+            runs.append((start, n - 1))
+        return runs
+
+    zone_rows = []
+    for grade in ("Good", "Moderate"):
+        for s, e in _intervals(quality == grade, int(min_zone_samples)):
+            zone_rows.append(
+                {
+                    "Top": float(depth.iloc[s]),
+                    "Base": float(depth.iloc[e]),
+                    "Thickness": float(depth.iloc[e] - depth.iloc[s]),
+                    "Samples": e - s + 1,
+                    "Mean Shmin (MPa)": float(shmin.iloc[s:e + 1].mean()),
+                    "Mean contrast (MPa)": float(contrast.iloc[s:e + 1].mean()),
+                    "Quality": grade,
+                }
+            )
+    zones = pd.DataFrame(zone_rows).sort_values("Top").reset_index(drop=True) if zone_rows else pd.DataFrame(
+        columns=["Top", "Base", "Thickness", "Samples", "Mean Shmin (MPa)", "Mean contrast (MPa)", "Quality"]
+    )
+
+    barrier_rows = [
+        {
+            "Top": float(depth.iloc[s]),
+            "Base": float(depth.iloc[e]),
+            "Thickness": float(depth.iloc[e] - depth.iloc[s]),
+            "Mean contrast (MPa)": float(contrast.iloc[s:e + 1].mean()),
+        }
+        for s, e in _intervals(cls == "Barrier", 2)
+    ]
+    barriers = pd.DataFrame(barrier_rows) if barrier_rows else pd.DataFrame(
+        columns=["Top", "Base", "Thickness", "Mean contrast (MPa)"]
+    )
+
+    return {"detail": detail, "zones": zones, "barriers": barriers}
 
 
 # ---------------------------------------------------------------------------
@@ -1108,9 +1249,8 @@ def generate_tornado_plot(
 
     settings are forwarded to run_tornado_analysis (method_label,
     calibration_multiplier, pr_multiplier, tstr_multiplier, custom_a,
-    custom_b, unit_system, ucs_method, fang_method, ucs_constant_mpa,
-    fang_constant_deg, stress_params). Values are converted to the selected
-    unit system for display.
+    custom_b, unit_system). Values are converted to the selected unit
+    system for display.
 
     Returns:
         fig: horizontal-bar tornado chart, largest swing on top.
