@@ -1,10 +1,12 @@
 """
 Quick MEM Calculator - Streamlit front end.
 
-A one-page Mechanical Earth Model (MEM) starter built on the geomechpy
-library: dynamic elastic properties, dynamic-to-static conversion and
-rock strength, with QC flagging and interactive Plotly log displays.
-Supports Oilfield and Metric unit systems for both input and display.
+A one-page Mechanical Earth Model (MEM) builder on top of the geomechpy
+library: dynamic elastic properties -> static conversion -> rock strength
+(selectable methods) -> overburden & pore pressure -> horizontal stresses ->
+vertical-well wellbore stability, with QC flagging, tornado sensitivity
+analysis and interactive Plotly displays. Supports Oilfield and Metric
+unit systems for both input and display.
 
 Run locally:   streamlit run app.py
 """
@@ -98,6 +100,47 @@ def depth_track_figure(df: pd.DataFrame, depth_col: str, tracks: list[tuple[str,
     return fig
 
 
+def mud_window_figure(disp: pd.DataFrame, depth_col: str, N: dict[str, str], unit: str, height: int = 700) -> go.Figure:
+    """NEW: mud weight window plot — safe window shaded between the breakout
+    (shear failure) and breakdown (fracture) mud weight limits."""
+    fig = go.Figure()
+    bo, bd = N.get("MW_BREAKOUT_GCC"), N.get("MW_BREAKDOWN_GCC")
+    if bo in disp.columns and bd in disp.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=disp[bo], y=disp[depth_col], mode="lines", name="Breakout limit (min MW)",
+                line=dict(color="#c82333"),
+                hovertemplate=f"Breakout: %{{x:.3f}} {unit}<br>Depth: %{{y:.1f}}<extra></extra>",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=disp[bd], y=disp[depth_col], mode="lines", name="Breakdown limit (max MW)",
+                line=dict(color="#1f77b4"), fill="tonextx", fillcolor="rgba(40, 167, 69, 0.18)",
+                hovertemplate=f"Breakdown: %{{x:.3f}} {unit}<br>Depth: %{{y:.1f}}<extra></extra>",
+            )
+        )
+    for canonical, label, dash in [("MW_PP_GCC", "Pore pressure EMW", "dot"), ("MW_SV_GCC", "Overburden EMW", "dash")]:
+        col = N.get(canonical)
+        if col in disp.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=disp[col], y=disp[depth_col], mode="lines", name=label,
+                    line=dict(dash=dash, color="gray"),
+                    hovertemplate=f"{label}: %{{x:.3f}} {unit}<br>Depth: %{{y:.1f}}<extra></extra>",
+                )
+            )
+    fig.update_yaxes(autorange="reversed", title_text=depth_col)
+    fig.update_layout(
+        height=height,
+        xaxis_title=f"Equivalent mud weight ({unit})",
+        legend=dict(orientation="h", yanchor="bottom", y=1.04),
+        margin=dict(t=80, b=40),
+        title="Mud weight window (green = safe drilling window)",
+    )
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # Sidebar: units, data input & calculation settings
 # ---------------------------------------------------------------------------
@@ -105,7 +148,7 @@ def depth_track_figure(df: pd.DataFrame, depth_col: str, tracks: list[tuple[str,
 with st.sidebar:
     st.title("🪨 Quick MEM Calculator")
     st.caption(
-        "1D Mechanical Earth Model starter kit powered by "
+        "1D Mechanical Earth Model builder powered by "
         "[geomechpy](https://github.com/sohwaisheng1/GeomechPy_WS)."
     )
     st.divider()
@@ -117,7 +160,15 @@ with st.sidebar:
         index=0,
         help="Controls how the uploaded data is interpreted AND how results are displayed.",
     )
-    expected = mc.INPUT_UNITS[unit_system]
+    depth_unit = st.radio(
+        "Depth (MD) unit",
+        mc.DEPTH_UNITS,
+        index=0,
+        horizontal=True,
+        help="Unit of the depth column. MD is assumed ≈ TVD (vertical well) for the stress calculations.",
+    )
+    expected = dict(mc.INPUT_UNITS[unit_system])
+    expected["DEPTH"] = depth_unit
     st.caption(
         "Expected input units — "
         + " · ".join(f"{curve}: {unit}" for curve, unit in expected.items())
@@ -216,6 +267,25 @@ with st.sidebar:
 
     st.divider()
     st.header("5. Rock strength")
+    # NEW: selectable UCS / FANG methods
+    ucs_method_label = st.selectbox(
+        "UCS method",
+        list(mc.UCS_METHODS.keys()),
+        help="UCS correlations from geomechpy.rock_strength, plus a constant-value fallback.",
+    )
+    ucs_method = mc.UCS_METHODS[ucs_method_label]
+    ucs_constant_mpa = 50.0
+    if ucs_method == "constant":
+        ucs_constant_mpa = st.number_input("Constant UCS (MPa)", value=50.0, min_value=0.1, format="%.1f")
+    fang_method_label = st.selectbox(
+        "Friction angle method",
+        list(mc.FANG_METHODS.keys()),
+        help="FANG correlations from geomechpy.rock_strength, plus a constant-value fallback.",
+    )
+    fang_method = mc.FANG_METHODS[fang_method_label]
+    fang_constant_deg = 30.0
+    if fang_method == "constant":
+        fang_constant_deg = st.number_input("Constant friction angle (deg)", value=30.0, min_value=1.0, max_value=60.0, format="%.1f")
     tstr_multiplier = st.slider(
         "Tensile strength / UCS ratio",
         min_value=0.05,
@@ -226,12 +296,91 @@ with st.sidebar:
     )
 
     st.divider()
+    st.header("6. Stress & wellbore stability")
+    # NEW: overburden / pore pressure / horizontal stress / stability inputs
+    compute_stress = st.checkbox(
+        "Compute stresses & mud weight window",
+        value=True,
+        help="Adds overburden, pore pressure, horizontal stresses and the vertical-well "
+        "mud weight window (geomechpy gradient-based + poroelastic methods).",
+    )
+    stress_params = None
+    if compute_stress:
+        setting = st.radio("Well setting", mc.WELL_SETTINGS, horizontal=True)
+        air_gap = st.number_input(
+            f"Air gap / KB elevation ({depth_unit})", value=0.0, min_value=0.0, format="%.1f",
+            help="Drill floor to ground level (onshore) or to mean sea level (offshore).",
+        )
+        water_depth, sea_gradient = 0.0, 0.47
+        if setting == "Offshore":
+            water_depth = st.number_input(f"Water depth ({depth_unit})", value=0.0, min_value=0.0, format="%.1f")
+            sea_gradient = st.number_input("Sea water gradient (psi/ft)", value=0.47, min_value=0.30, max_value=0.60, format="%.3f")
+        ovb_source_label = st.selectbox(
+            "Overburden gradient source",
+            list(mc.OVB_GRADIENT_SOURCES.keys()),
+            help="Constant lithostatic gradient, or a gradient derived from the mean of the "
+            "mapped RHOB log (mean g/cc × 0.4335 psi/ft).",
+        )
+        ovb_source = mc.OVB_GRADIENT_SOURCES[ovb_source_label]
+        ovb_gradient = st.number_input(
+            "Lithostatic gradient (psi/ft)", value=1.05, min_value=0.5, max_value=1.5, format="%.3f",
+            disabled=(ovb_source == "density"),
+            help="Typical 1.0–1.1 psi/ft. Ignored when the gradient is derived from RHOB.",
+        )
+        pp_gradient = st.number_input(
+            "Pore pressure gradient (psi/ft)", value=0.47, min_value=0.30, max_value=1.0, format="%.3f",
+            help="Hydrostatic ≈ 0.433–0.47 psi/ft; higher = overpressure.",
+        )
+        shmax_method_label = st.selectbox("SHmax method", list(mc.SHMAX_METHODS.keys()))
+        shmax_method = mc.SHMAX_METHODS[shmax_method_label]
+        shmax_multiplier = 1.1
+        if shmax_method == "multiplier":
+            shmax_multiplier = st.slider("SHmax / Shmin multiplier", 1.0, 2.0, 1.1, 0.05)
+        biot = st.slider("Biot coefficient", 0.5, 1.0, 1.0, 0.05)
+        c_ex, c_ey = st.columns(2)
+        ex = c_ex.number_input("Tectonic strain EX", value=0.0001, format="%.5f",
+                               help="Poroelastic tectonic strain term (Shmin direction).")
+        ey = c_ey.number_input("Tectonic strain EY", value=0.009, format="%.5f",
+                               help="Poroelastic tectonic strain term (SHmax direction). Keep EY ≥ EX.")
+        stress_params = {
+            "setting": setting,
+            "depth_unit": depth_unit,
+            "air_gap": air_gap,
+            "water_depth": water_depth,
+            "sea_gradient_psift": sea_gradient,
+            "ovb_source": ovb_source,
+            "ovb_gradient_psift": ovb_gradient,
+            "pp_gradient_psift": pp_gradient,
+            "shmax_method": shmax_method,
+            "shmax_multiplier": shmax_multiplier,
+            "biot": biot,
+            "ex": ex,
+            "ey": ey,
+        }
+
+    st.divider()
     run_clicked = st.button(
         "🚀 Run MEM Calculation",
         type="primary",
         use_container_width=True,
         disabled=st.session_state.raw_df is None,
     )
+
+# Bundle the workflow settings once — used by the run button and the tornado tab.
+workflow_settings = dict(
+    method_label=method_label,
+    calibration_multiplier=calibration_multiplier,
+    pr_multiplier=pr_multiplier,
+    tstr_multiplier=tstr_multiplier,
+    custom_a=custom_a,
+    custom_b=custom_b,
+    unit_system=unit_system,
+    ucs_method=ucs_method,
+    fang_method=fang_method,
+    ucs_constant_mpa=ucs_constant_mpa,
+    fang_constant_deg=fang_constant_deg,
+    stress_params=stress_params,
+)
 
 # ---------------------------------------------------------------------------
 # Run the workflow
@@ -242,17 +391,11 @@ if run_clicked:
         st.session_state.unit_warnings = mc.check_unit_sanity(
             st.session_state.raw_df, column_map, unit_system
         )
-        with st.spinner("Computing dynamic, static and strength properties..."):
+        with st.spinner("Computing properties, stresses and stability..."):
             results = mc.run_full_workflow(
                 data=st.session_state.raw_df,
                 column_map=column_map,
-                method_label=method_label,
-                calibration_multiplier=calibration_multiplier,
-                pr_multiplier=pr_multiplier,
-                tstr_multiplier=tstr_multiplier,
-                custom_a=custom_a,
-                custom_b=custom_b,
-                unit_system=unit_system,
+                **workflow_settings,
             )
         st.session_state.results_df = results
         st.session_state.qc_summary, st.session_state.qc_flags = mc.run_qc(results)
@@ -269,7 +412,7 @@ if run_clicked:
 st.title("Quick MEM Calculator")
 st.markdown(
     "Build a quick-look **Mechanical Earth Model** from standard well logs: "
-    "dynamic elastic properties → static conversion → rock strength, with built-in QC."
+    "dynamic → static properties → rock strength → stresses → mud weight window, with built-in QC."
 )
 
 for warning in st.session_state.unit_warnings:
@@ -284,18 +427,31 @@ if results is not None:
     disp, N = mc.display_results(results, unit_system)
     flags_disp = flags.rename(columns=N) if flags is not None else None
     DEPTH = N["DEPTH"]
+    has_stress = "SV_MPA" in results.columns
 else:
-    disp, N, flags_disp, DEPTH = None, {}, None, None
+    disp, N, flags_disp, DEPTH, has_stress = None, {}, None, None, False
 
-tab_input, tab_dyn, tab_sta, tab_strength, tab_qc, tab_viz, tab_tornado = st.tabs(
+(
+    tab_input,
+    tab_dyn,
+    tab_sta,
+    tab_strength,
+    tab_ovb,
+    tab_hstress,
+    tab_wbs,
+    tab_tornado,
+    tab_qc,
+) = st.tabs(
     [
         "📥 Data Input",
         "🌊 Dynamic Props",
         "🧱 Static Props",
         "💪 Rock Strength",
-        "✅ QC Report",
-        "📊 Visualizations",
-        "🌪️ Sensitivity Analysis (Tornado Plot)",
+        "🏔️ Overburden & Pore Pressure",
+        "↔️ Horizontal Stress",
+        "🛢️ Wellbore Stability",
+        "🌪️ Sensitivity (Tornado)",
+        "✅ QC & Results",
     ]
 )
 
@@ -332,7 +488,7 @@ with tab_input:
         c2.metric("Columns", df_in.shape[1])
         depth_col = column_map.get("DEPTH") if column_map else None
         if depth_col:
-            c3.metric("Depth range", f"{df_in[depth_col].min():.0f} – {df_in[depth_col].max():.0f}")
+            c3.metric("Depth range", f"{df_in[depth_col].min():.0f} – {df_in[depth_col].max():.0f} {depth_unit}")
         st.subheader("Input data preview")
         st.dataframe(df_in, use_container_width=True, height=420)
         with st.expander("Basic statistics"):
@@ -383,15 +539,15 @@ with tab_sta:
         )
         st.plotly_chart(fig, use_container_width=True)
 
-# --- Tab 4: Rock strength -----------------------------------------------------
+# --- Tab 4: Rock strength (with method selection) -----------------------------
 with tab_strength:
     if results is None:
         st.info("Run the calculation from the sidebar to see rock strength results.")
     else:
         st.subheader(f"Rock strength ({unit_system})")
         st.caption(
-            "UCS from Plumb (1994) static-YME correlation · "
-            f"TSTR = {tstr_multiplier:.2f} × UCS · friction angle from Lal (1999) shale correlation."
+            f"UCS: **{ucs_method_label}** · FANG: **{fang_method_label}** · "
+            f"TSTR = {tstr_multiplier:.2f} × UCS."
         )
         str_cols = [DEPTH] + [N[c] for c in ["UCS_MPA", "TSTR_MPA", "FANG_DEG"]]
         st.dataframe(style_flags(disp, flags_disp, str_cols), use_container_width=True, height=420)
@@ -409,90 +565,127 @@ with tab_strength:
             use_container_width=True,
         )
 
-# --- Tab 5: QC report ---------------------------------------------------------
-with tab_qc:
-    if results is None or st.session_state.qc_summary is None:
-        st.info("Run the calculation from the sidebar to generate the QC report.")
-    else:
-        qc = st.session_state.qc_summary
-        status = mc.qc_status(qc)
-        badge = {"PASS": "🟢 PASS", "WARNING": "🟡 WARNING", "FAIL": "🔴 FAIL"}[status]
-        st.subheader(f"QC report — overall status: {badge}")
-        st.caption(
-            "Each curve is checked against standard geomechanical ranges "
-            "(expressed in the units shown in the Unit column). "
-            "LOW/HIGH = outside range, MISSING = null/non-numeric."
-        )
-
-        def _pct_color(v):
-            if v >= 95:
-                return "background-color: #1e7e34; color: white"
-            if v >= 70:
-                return "background-color: #d39e00; color: black"
-            return "background-color: #c82333; color: white"
-
-        st.dataframe(
-            qc.style.map(_pct_color, subset=["% in range"]).format({"% in range": "{:.1f}"}),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        flagged_canonical = [c for c in flags.columns if (flags[c] != "OK").any()]
-        if flagged_canonical:
-            st.markdown("**Flagged samples** (rows where at least one curve is out of range or missing):")
-            bad_rows = flags[flagged_canonical].ne("OK").any(axis=1)
-            show_cols = [DEPTH] + [N[c] for c in flagged_canonical if c in N]
-            st.dataframe(
-                style_flags(disp.loc[bad_rows], flags_disp.loc[bad_rows], show_cols),
-                use_container_width=True,
-                height=350,
-            )
-        else:
-            st.success("All samples passed QC — no flags raised. 🎉")
-
-# --- Tab 6: Visualizations ------------------------------------------------------
-with tab_viz:
+# --- Tab 5: NEW — Overburden & Pore Pressure ----------------------------------
+with tab_ovb:
     if results is None:
-        st.info("Run the calculation from the sidebar to see the composite MEM plot.")
+        st.info("Run the calculation from the sidebar to see the overburden and pore pressure profiles.")
+    elif not has_stress:
+        st.info("Enable **Compute stresses & mud weight window** in the sidebar and re-run.")
     else:
-        st.subheader(f"Composite MEM display ({unit_system})")
+        st.subheader(f"Overburden stress & pore pressure ({unit_system})")
+        sp = stress_params or {}
+        st.caption(
+            f"Setting: **{sp.get('setting', '-')}** · air gap {sp.get('air_gap', 0):g} {depth_unit}"
+            + (f" · water depth {sp.get('water_depth', 0):g} {depth_unit}" if sp.get("setting") == "Offshore" else "")
+            + f" · Sv gradient source: {sp.get('ovb_source', '-')}"
+            + f" · Pp gradient {sp.get('pp_gradient_psift', 0):.3f} psi/ft. MD assumed ≈ TVD (vertical well)."
+        )
+        ovb_cols = [DEPTH] + [N[c] for c in ["SV_MPA", "PP_MPA", "MW_SV_GCC", "MW_PP_GCC"]]
+        st.dataframe(style_flags(disp, flags_disp, ovb_cols), use_container_width=True, height=380)
+        mw_unit = mc.display_unit("MW_PP_GCC", unit_system)
         st.plotly_chart(
             depth_track_figure(
                 disp,
                 DEPTH,
                 [
-                    ("GR (gAPI)", [(N["GR"], "GR")]),
-                    (f"RHOB ({mc.display_unit('RHOB', unit_system)})", [(N["RHOB"], "RHOB")]),
-                    (f"Slowness ({mc.display_unit('DTCO', unit_system)})", [(N["DTCO"], "DTCO"), (N["DTSM"], "DTSM")]),
-                    (f"E ({mc.display_unit('YME_DYN_GPA', unit_system)})", [(N["YME_DYN_GPA"], "E dyn"), (N["YME_STA_GPA"], "E sta")]),
-                    ("ν (-)", [(N["PR_DYN"], "ν dyn"), (N["PR_STA"], "ν sta")]),
-                    (f"UCS / TSTR ({mc.display_unit('UCS_MPA', unit_system)})", [(N["UCS_MPA"], "UCS"), (N["TSTR_MPA"], "TSTR")]),
-                    ("FANG (°)", [(N["FANG_DEG"], "FANG")]),
+                    (f"Pressure ({mc.display_unit('SV_MPA', unit_system)})", [(N["SV_MPA"], "Sv"), (N["PP_MPA"], "Pp")]),
+                    (f"Equivalent gradients ({mw_unit})", [(N["MW_SV_GCC"], "Sv EMW"), (N["MW_PP_GCC"], "Pp EMW")]),
                 ],
-                height=800,
+                height=650,
             ),
             use_container_width=True,
         )
 
-        st.subheader("Crossplot explorer")
-        numeric_cols = [c for c in disp.columns if pd.api.types.is_numeric_dtype(disp[c])]
-        c1, c2, c3 = st.columns(3)
-        x_col = c1.selectbox("X axis", numeric_cols, index=numeric_cols.index(N["YME_DYN_GPA"]) if N.get("YME_DYN_GPA") in numeric_cols else 0)
-        y_col = c2.selectbox("Y axis", numeric_cols, index=numeric_cols.index(N["YME_STA_GPA"]) if N.get("YME_STA_GPA") in numeric_cols else 0)
-        color_col = c3.selectbox("Color by", numeric_cols, index=numeric_cols.index(N["GR"]) if N.get("GR") in numeric_cols else 0)
-        xfig = go.Figure(
-            go.Scatter(
-                x=disp[x_col],
-                y=disp[y_col],
-                mode="markers",
-                marker=dict(color=disp[color_col], colorscale="Viridis", showscale=True, colorbar_title=color_col),
-                hovertemplate=f"{x_col}: %{{x:.3f}}<br>{y_col}: %{{y:.3f}}<extra></extra>",
-            )
+# --- Tab 6: NEW — Horizontal Stress -------------------------------------------
+with tab_hstress:
+    if results is None:
+        st.info("Run the calculation from the sidebar to see horizontal stresses.")
+    elif not has_stress:
+        st.info("Enable **Compute stresses & mud weight window** in the sidebar and re-run.")
+    else:
+        st.subheader(f"Horizontal stresses ({unit_system})")
+        sp = stress_params or {}
+        method_txt = [k for k, v in mc.SHMAX_METHODS.items() if v == sp.get("shmax_method")]
+        st.caption(
+            f"Method: **{method_txt[0] if method_txt else '-'}** · Biot {sp.get('biot', 1.0):.2f} · "
+            f"EX {sp.get('ex', 0):g} · EY {sp.get('ey', 0):g}"
+            + (f" · SHmax multiplier ×{sp.get('shmax_multiplier', 1.1):.2f}" if sp.get("shmax_method") == "multiplier" else "")
+            + ". Shmin from the poroelastic equation (static PR & YME, Biot, tectonic strains)."
         )
-        xfig.update_layout(xaxis_title=x_col, yaxis_title=y_col, height=520)
-        st.plotly_chart(xfig, use_container_width=True)
+        hs_cols = [DEPTH] + [N[c] for c in ["SV_MPA", "PP_MPA", "SHMIN_MPA", "SHMAX_MPA", "Q_FACTOR", "SH_RATIO"]]
+        st.dataframe(style_flags(disp, flags_disp, hs_cols), use_container_width=True, height=380)
 
-# --- Tab 7: Sensitivity analysis (Tornado plot) --------------------------------
+        q_med = pd.to_numeric(results["Q_FACTOR"], errors="coerce").median()
+        if pd.notna(q_med):
+            regime = "Normal" if q_med < 1 else ("Strike-slip" if q_med < 2 else "Reverse")
+            st.metric("Median stress regime q-factor", f"{q_med:.2f}", help="q<1 normal · 1–2 strike-slip · 2–3 reverse")
+            st.caption(f"Dominant stress regime over the interval: **{regime} faulting**.")
+
+        st.plotly_chart(
+            depth_track_figure(
+                disp,
+                DEPTH,
+                [
+                    (
+                        f"Stresses ({mc.display_unit('SV_MPA', unit_system)})",
+                        [(N["SV_MPA"], "Sv"), (N["SHMAX_MPA"], "SHmax"), (N["SHMIN_MPA"], "Shmin"), (N["PP_MPA"], "Pp")],
+                    ),
+                    ("q-factor (-)", [(N["Q_FACTOR"], "q")]),
+                    ("SHmax/Shmin (-)", [(N["SH_RATIO"], "ratio")]),
+                ],
+                height=650,
+            ),
+            use_container_width=True,
+        )
+
+# --- Tab 7: NEW — Wellbore Stability ------------------------------------------
+with tab_wbs:
+    if results is None:
+        st.info("Run the calculation from the sidebar to see the wellbore stability results.")
+    elif not has_stress:
+        st.info("Enable **Compute stresses & mud weight window** in the sidebar and re-run.")
+    else:
+        st.subheader(f"Wellbore stability — vertical well ({unit_system})")
+        st.caption(
+            "Breakout limit: Mohr-Coulomb shear failure (Kirsch, analytical) — drilling below it risks breakouts. "
+            "Breakdown limit: fracture initiation (Hubbert & Willis) — drilling above it risks losses. "
+            "The green band between them is the safe mud weight window."
+        )
+
+        mw_unit = mc.display_unit("MW_BREAKOUT_GCC", unit_system)
+        window = results["MW_BREAKDOWN_GCC"] - results["MW_BREAKOUT_GCC"]
+        n_valid = int(window.notna().sum())
+        n_closed = int((window < 0).sum())
+        c1, c2, c3 = st.columns(3)
+        factor = mc.PPG_PER_GCC if unit_system == mc.OILFIELD else 1.0
+        c1.metric(f"Median breakout limit ({mw_unit})", f"{results['MW_BREAKOUT_GCC'].median() * factor:.2f}")
+        c2.metric(f"Median breakdown limit ({mw_unit})", f"{results['MW_BREAKDOWN_GCC'].median() * factor:.2f}")
+        c3.metric(f"Median window width ({mw_unit})", f"{window.median() * factor:.2f}")
+        if n_closed:
+            st.warning(
+                f"⚠️ The mud weight window is closed (breakout limit above breakdown limit) at "
+                f"{n_closed} of {n_valid} depth samples — no safe static mud weight exists there."
+            )
+
+        wbs_cols = [DEPTH] + [N[c] for c in ["PW_BREAKOUT_MPA", "PW_BREAKDOWN_MPA", "MW_BREAKOUT_GCC", "MW_BREAKDOWN_GCC", "MW_PP_GCC", "MW_SV_GCC"]]
+        st.dataframe(style_flags(disp, flags_disp, wbs_cols), use_container_width=True, height=380)
+        st.plotly_chart(mud_window_figure(disp, DEPTH, N, mw_unit), use_container_width=True)
+        st.plotly_chart(
+            depth_track_figure(
+                disp,
+                DEPTH,
+                [
+                    (
+                        f"Limit pressures ({mc.display_unit('PW_BREAKOUT_MPA', unit_system)})",
+                        [(N["PW_BREAKOUT_MPA"], "Breakout Pw"), (N["PW_BREAKDOWN_MPA"], "Breakdown Pw"), (N["PP_MPA"], "Pp")],
+                    ),
+                ],
+                height=550,
+            ),
+            use_container_width=True,
+        )
+
+# --- Tab 8: Sensitivity analysis (Tornado plot) --------------------------------
 with tab_tornado:
     st.subheader("Sensitivity Analysis (Tornado Plot)")
     st.markdown(
@@ -507,15 +700,18 @@ with tab_tornado:
 
         Notes: GR is carried through the workflow but does not enter any calculation
         (QC only), so its bar is expectedly zero. POROSITY only affects results when the
-        Morales static correlation is selected. The analysis uses the current sidebar
-        settings (unit system, static method, multipliers).
+        Morales static correlation is selected. Stress and mud-weight targets are available
+        when stress computation is enabled. The analysis uses the current sidebar settings.
         """
     )
     if st.session_state.raw_df is None:
         st.info("👈 Load data in the sidebar first — the tornado plot needs a base case.")
     else:
         c1, c2 = st.columns(2)
-        target_options = [mc.display_name(t, unit_system) for t in mc.TORNADO_TARGETS]
+        tornado_targets = list(mc.TORNADO_TARGETS)
+        if stress_params is not None:
+            tornado_targets += mc.TORNADO_STRESS_TARGETS
+        target_options = [mc.display_name(t, unit_system) for t in tornado_targets]
         target_label_sel = c1.selectbox(
             "Target Output",
             target_options,
@@ -523,7 +719,7 @@ with tab_tornado:
             key="tornado_target",
             help="Result whose sensitivity is analysed (depth-averaged mean).",
         )
-        target_canonical = mc.TORNADO_TARGETS[target_options.index(target_label_sel)]
+        target_canonical = tornado_targets[target_options.index(target_label_sel)]
         variation_pct = c2.select_slider(
             "Variation Range",
             options=[5, 10, 20],
@@ -540,13 +736,7 @@ with tab_tornado:
                         column_map,
                         target_canonical,
                         variation_pct,
-                        method_label=method_label,
-                        calibration_multiplier=calibration_multiplier,
-                        pr_multiplier=pr_multiplier,
-                        tstr_multiplier=tstr_multiplier,
-                        custom_a=custom_a,
-                        custom_b=custom_b,
-                        unit_system=unit_system,
+                        **workflow_settings,
                     )
                 st.session_state.tornado = {
                     "fig": fig,
@@ -588,23 +778,100 @@ with tab_tornado:
                 f"static method: {tornado['method']}. Re-generate after changing data or settings."
             )
 
-# ---------------------------------------------------------------------------
-# Download
-# ---------------------------------------------------------------------------
+# --- Tab 9: QC & Results ------------------------------------------------------
+with tab_qc:
+    if results is None or st.session_state.qc_summary is None:
+        st.info("Run the calculation from the sidebar to generate the QC report.")
+    else:
+        qc = st.session_state.qc_summary
+        status = mc.qc_status(qc)
+        badge = {"PASS": "🟢 PASS", "WARNING": "🟡 WARNING", "FAIL": "🔴 FAIL"}[status]
+        st.subheader(f"QC report — overall status: {badge}")
+        st.caption(
+            "Each curve is checked against standard geomechanical ranges "
+            "(expressed in the units shown in the Unit column). "
+            "LOW/HIGH = outside range, MISSING = null/non-numeric."
+        )
 
-if results is not None:
-    st.divider()
-    st.download_button(
-        f"⬇️ Download results as CSV ({unit_system})",
-        data=mc.results_to_csv_bytes(disp),
-        file_name="mem_results.csv",
-        mime="text/csv",
-        type="primary",
-    )
+        def _pct_color(v):
+            if v >= 95:
+                return "background-color: #1e7e34; color: white"
+            if v >= 70:
+                return "background-color: #d39e00; color: black"
+            return "background-color: #c82333; color: white"
+
+        st.dataframe(
+            qc.style.map(_pct_color, subset=["% in range"]).format({"% in range": "{:.1f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        flagged_canonical = [c for c in flags.columns if (flags[c] != "OK").any()]
+        if flagged_canonical:
+            st.markdown("**Flagged samples** (rows where at least one curve is out of range or missing):")
+            bad_rows = flags[flagged_canonical].ne("OK").any(axis=1)
+            show_cols = [DEPTH] + [N[c] for c in flagged_canonical if c in N]
+            st.dataframe(
+                style_flags(disp.loc[bad_rows], flags_disp.loc[bad_rows], show_cols),
+                use_container_width=True,
+                height=350,
+            )
+        else:
+            st.success("All samples passed QC — no flags raised. 🎉")
+
+        st.divider()
+        st.subheader(f"Composite MEM display ({unit_system})")
+        composite_tracks = [
+            ("GR (gAPI)", [(N["GR"], "GR")]),
+            (f"Slowness ({mc.display_unit('DTCO', unit_system)})", [(N["DTCO"], "DTCO"), (N["DTSM"], "DTSM")]),
+            (f"E ({mc.display_unit('YME_DYN_GPA', unit_system)})", [(N["YME_DYN_GPA"], "E dyn"), (N["YME_STA_GPA"], "E sta")]),
+            (f"UCS / TSTR ({mc.display_unit('UCS_MPA', unit_system)})", [(N["UCS_MPA"], "UCS"), (N["TSTR_MPA"], "TSTR")]),
+        ]
+        if has_stress:
+            mw_unit = mc.display_unit("MW_PP_GCC", unit_system)
+            composite_tracks += [
+                (
+                    f"Stresses ({mc.display_unit('SV_MPA', unit_system)})",
+                    [(N["SV_MPA"], "Sv"), (N["SHMAX_MPA"], "SHmax"), (N["SHMIN_MPA"], "Shmin"), (N["PP_MPA"], "Pp")],
+                ),
+                (
+                    f"Mud window ({mw_unit})",
+                    [(N["MW_BREAKOUT_GCC"], "MW min"), (N["MW_BREAKDOWN_GCC"], "MW max"), (N["MW_PP_GCC"], "Pp EMW")],
+                ),
+            ]
+        st.plotly_chart(depth_track_figure(disp, DEPTH, composite_tracks, height=800), use_container_width=True)
+
+        with st.expander("Crossplot explorer"):
+            numeric_cols = [c for c in disp.columns if pd.api.types.is_numeric_dtype(disp[c])]
+            c1, c2, c3 = st.columns(3)
+            x_col = c1.selectbox("X axis", numeric_cols, index=numeric_cols.index(N["YME_DYN_GPA"]) if N.get("YME_DYN_GPA") in numeric_cols else 0)
+            y_col = c2.selectbox("Y axis", numeric_cols, index=numeric_cols.index(N["YME_STA_GPA"]) if N.get("YME_STA_GPA") in numeric_cols else 0)
+            color_col = c3.selectbox("Color by", numeric_cols, index=numeric_cols.index(N["GR"]) if N.get("GR") in numeric_cols else 0)
+            xfig = go.Figure(
+                go.Scatter(
+                    x=disp[x_col],
+                    y=disp[y_col],
+                    mode="markers",
+                    marker=dict(color=disp[color_col], colorscale="Viridis", showscale=True, colorbar_title=color_col),
+                    hovertemplate=f"{x_col}: %{{x:.3f}}<br>{y_col}: %{{y:.3f}}<extra></extra>",
+                )
+            )
+            xfig.update_layout(xaxis_title=x_col, yaxis_title=y_col, height=520)
+            st.plotly_chart(xfig, use_container_width=True)
+
+        st.divider()
+        st.download_button(
+            f"⬇️ Download results as CSV ({unit_system})",
+            data=mc.results_to_csv_bytes(disp),
+            file_name="mem_results.csv",
+            mime="text/csv",
+            type="primary",
+        )
 
 st.divider()
 st.caption(
     "Quick MEM Calculator · built with [Streamlit](https://streamlit.io) + "
     "[geomechpy](https://github.com/sohwaisheng1/GeomechPy_WS) · "
-    "correlations: Bradford (1998), Najibi (2015), Fuller, Morales (1993), Plumb (1994), Lal (1999)."
+    "correlations: Bradford (1998), Najibi (2015), Fuller, Morales (1993), Plumb (1994), Lal (1999), "
+    "Thiercelin & Plumb (1994), Hubbert & Willis (1957), Al-Ajmi & Zimmerman (2006)."
 )
