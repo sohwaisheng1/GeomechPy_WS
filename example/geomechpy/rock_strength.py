@@ -178,3 +178,53 @@ class RockStrengthPropertiesConverter:
             RockStrengthPropertiesConverter.convert_friction_angle_lal(dtco=value)
             for value in dtco
         ]
+
+    @staticmethod
+        def convert_gr_to_fang_custom_linear(
+            gr: float, gr_min: float, gr_max: float
+        ) -> float:
+            """
+            Convert gamma ray (GR) to friction angle (FANG) using a custom linear correlation.
+            Equation type: Linear law (y = a - b*x), interpolated between clean sand and shale endpoints.
+            Applicable for: custom/generic, calibrated per-well or per-field via GR_min/GR_max.
+            Reference: Custom correlation — linear proportion to gamma ray.
+               FANG = 45 - 30 * (GR - GR_min) / (GR_max - GR_min)
+               Clean sand (low GR) -> 45 deg, Shale (high GR) -> 15 deg.
+            Args:
+               gr (float): Gamma ray reading at depth. Unit: API (or gAPI)
+               gr_min (float): Gamma ray cutoff for clean sand (0% shale). Unit: API
+               gr_max (float): Gamma ray cutoff for pure shale (100% shale). Unit: API
+            Returns:
+               fang_custom_linear: Friction angle (FANG) from custom GR-linear correlation. Unit: degrees
+            """
+            if gr_max == gr_min:
+                raise ValueError("gr_max must not equal gr_min (division by zero).")
+    
+            fang_custom_linear = 45.0 - 30.0 * (gr - gr_min) / (gr_max - gr_min)
+    
+            # Clamp to the correlation's defined endpoints (15-45 deg) — GR readings outside
+            # [gr_min, gr_max] otherwise extrapolate past the physically intended sand/shale bounds.
+            fang_custom_linear = max(15.0, min(45.0, fang_custom_linear))
+    
+            return float(fang_custom_linear)
+    
+        @staticmethod
+        def convert_gr_to_fang_custom_linear_array(
+            gr: list[float], gr_min: float, gr_max: float
+        ) -> list[float]:
+            """
+            Convert an array of gamma ray (GR) values to friction angle (FANG) using a custom
+            linear correlation.
+            Args:
+               gr (list[float]): Gamma ray readings. Unit: API (or gAPI)
+               gr_min (float): Gamma ray cutoff for clean sand (0% shale). Unit: API
+               gr_max (float): Gamma ray cutoff for pure shale (100% shale). Unit: API
+            Returns:
+               fang_custom_linear (list[float]): FANG values from custom GR-linear correlation. Unit: degrees
+            """
+            return [
+                RockStrengthPropertiesConverter.convert_gr_to_fang_custom_linear(
+                    gr=value, gr_min=gr_min, gr_max=gr_max
+                )
+                for value in gr
+            ]
