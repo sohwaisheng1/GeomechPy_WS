@@ -232,10 +232,12 @@ QC_RANGES = {
 # option is provided as a generic app-level fallback for calibration work.
 UCS_METHODS = {
     "Plumb (1994) — from static YME [geomechpy]": "plumb",
+    "McNally (1987) — from DTCO, sandstone [geomechpy]": "mcnally",
     "Constant value": "constant",
 }
 FANG_METHODS = {
     "Lal (1999) — from DTCO, shale [geomechpy]": "lal",
+    "GR custom linear (sand→shale, GRmin/GRmax) [geomechpy]": "gr_linear",
     "Constant value": "constant",
 }
 
