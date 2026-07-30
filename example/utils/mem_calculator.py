@@ -588,11 +588,16 @@ def compute_rock_strength(
     fang_method: str = "lal",
     ucs_constant_mpa: float = 50.0,
     fang_constant_deg: float = 30.0,
+    fang_gr_min: float = 15.0,
+    fang_gr_max: float = 120.0,
 ) -> pd.DataFrame:
     """Compute UCS, tensile strength and friction angle with selectable methods.
 
-    ucs_method:  'plumb' (geomechpy Plumb 1994 from static YME) or 'constant'.
-    fang_method: 'lal' (geomechpy Lal 1999 from DTCO) or 'constant'.
+    ucs_method:  'plumb' (geomechpy Plumb 1994 from static YME),
+                 'mcnally' (geomechpy McNally 1987 from DTCO, sandstone) or 'constant'.
+    fang_method: 'lal' (geomechpy Lal 1999 from DTCO),
+                 'gr_linear' (geomechpy custom GR sand->shale linear,
+                 45 deg at GRmin -> 15 deg at GRmax) or 'constant'.
     TSTR is always tstr_multiplier x UCS (geomechpy constant-multiplier law).
 
     Unit handling:
@@ -613,12 +618,22 @@ def compute_rock_strength(
 
     yme_sta = out["YME_STA_GPA"].to_numpy(dtype=float) * 1000.0  # GPa -> MPa
     dtco = pd.to_numeric(out["DTCO"], errors="coerce").to_numpy(dtype=float)
+    gr = (
+        pd.to_numeric(out["GR"], errors="coerce").to_numpy(dtype=float)
+        if "GR" in out.columns
+        else np.full(n, np.nan)
+    )
 
     for i in range(n):
         # --- UCS ---
         if ucs_method == "constant":
             ucs_psi[i] = ucs_constant_mpa * MPA_TO_PSI
-        elif np.isfinite(yme_sta[i]) and yme_sta[i] > 0:
+        elif ucs_method == "mcnally":
+            if np.isfinite(dtco[i]) and dtco[i] > 0:
+                ucs_psi[i] = conv.convert_dtco_to_ucs_mcnally_sandstone(
+                    dtco=float(dtco[i]), output_unit="psi"
+                )
+        elif np.isfinite(yme_sta[i]) and yme_sta[i] > 0:  # plumb
             ucs_psi[i] = conv.convert_yme_sta_to_ucs_plumb(yme_sta=float(yme_sta[i]))
         # --- TSTR (always derived from UCS) ---
         if np.isfinite(ucs_psi[i]):
@@ -626,7 +641,15 @@ def compute_rock_strength(
         # --- FANG ---
         if fang_method == "constant":
             fang[i] = fang_constant_deg
-        elif np.isfinite(dtco[i]) and dtco[i] > 0:
+        elif fang_method == "gr_linear":
+            if np.isfinite(gr[i]):
+                try:
+                    fang[i] = conv.convert_gr_to_fang_custom_linear(
+                        gr=float(gr[i]), gr_min=fang_gr_min, gr_max=fang_gr_max
+                    )
+                except (ValueError, ZeroDivisionError):  # gr_max == gr_min guard
+                    pass
+        elif np.isfinite(dtco[i]) and dtco[i] > 0:  # lal
             try:
                 fang[i] = conv.convert_friction_angle_lal(dtco=float(dtco[i]))
             except (ValueError, ZeroDivisionError):  # asin domain / dt=0 guards
@@ -1055,6 +1078,8 @@ def run_full_workflow(
     fang_method: str = "lal",
     ucs_constant_mpa: float = 50.0,
     fang_constant_deg: float = 30.0,
+    fang_gr_min: float = 15.0,
+    fang_gr_max: float = 120.0,
     stress_params: dict | None = None,
 ) -> pd.DataFrame:
     """Rename mapped columns to standard mnemonics, convert the input to
@@ -1090,6 +1115,8 @@ def run_full_workflow(
         fang_method=fang_method,
         ucs_constant_mpa=ucs_constant_mpa,
         fang_constant_deg=fang_constant_deg,
+        fang_gr_min=fang_gr_min,
+        fang_gr_max=fang_gr_max,
     )
     if stress_params is not None:
         df = compute_stress_profile(df, stress_params)
@@ -1148,6 +1175,8 @@ def run_tornado_analysis(
     fang_method: str = "lal",
     ucs_constant_mpa: float = 50.0,
     fang_constant_deg: float = 30.0,
+    fang_gr_min: float = 15.0,
+    fang_gr_max: float = 120.0,
     stress_params: dict | None = None,
 ) -> tuple[pd.DataFrame, float, list[str]]:
     """One-at-a-time sensitivity of a target output to the main inputs.
@@ -1181,6 +1210,8 @@ def run_tornado_analysis(
         fang_method=fang_method,
         ucs_constant_mpa=ucs_constant_mpa,
         fang_constant_deg=fang_constant_deg,
+        fang_gr_min=fang_gr_min,
+        fang_gr_max=fang_gr_max,
         stress_params=stress_params,
     )
 
