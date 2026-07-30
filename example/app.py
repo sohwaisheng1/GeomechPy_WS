@@ -292,8 +292,15 @@ with st.sidebar:
     )
     fang_method = mc.FANG_METHODS[fang_method_label]
     fang_constant_deg = 30.0
+    fang_gr_min, fang_gr_max = 15.0, 120.0
     if fang_method == "constant":
         fang_constant_deg = st.number_input("Constant friction angle (deg)", value=30.0, min_value=1.0, max_value=60.0, format="%.1f")
+    elif fang_method == "gr_linear":
+        cgr1, cgr2 = st.columns(2)
+        fang_gr_min = cgr1.number_input("GR min (clean sand, gAPI)", value=15.0, format="%.1f",
+                                        help="GR at clean sand → FANG = 45°.")
+        fang_gr_max = cgr2.number_input("GR max (pure shale, gAPI)", value=120.0, format="%.1f",
+                                        help="GR at pure shale → FANG = 15°. Must differ from GR min.")
     tstr_multiplier = st.slider(
         "Tensile strength / UCS ratio",
         min_value=0.05,
@@ -387,6 +394,8 @@ workflow_settings = dict(
     fang_method=fang_method,
     ucs_constant_mpa=ucs_constant_mpa,
     fang_constant_deg=fang_constant_deg,
+    fang_gr_min=fang_gr_min,
+    fang_gr_max=fang_gr_max,
     stress_params=stress_params,
 )
 
