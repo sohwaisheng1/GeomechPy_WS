@@ -77,6 +77,7 @@ INPUT_UNITS = {
 # displayed value. Order here defines display column order.
 DISPLAY_SPEC: dict[str, tuple[str, tuple[str, float], tuple[str, float]]] = {
     "DEPTH": ("MD", ("", 1.0), ("", 1.0)),  # passed through in the input depth unit
+    "LITHO_CODE": ("LITHO", ("code", 1.0), ("code", 1.0)),  # NEW: mechanical stratigraphy flag
     "GR": ("GR", ("gAPI", 1.0), ("gAPI", 1.0)),
     "RHOB": ("RHOB", ("g/cc", 1.0), ("kg/m³", GCC_TO_KGM3)),
     "DTCO": ("DTCO", ("µs/ft", 1.0), ("µs/m", 1.0 / M_PER_FT)),
@@ -590,6 +591,7 @@ def compute_rock_strength(
     fang_constant_deg: float = 30.0,
     fang_gr_min: float = 15.0,
     fang_gr_max: float = 120.0,
+    ucs_multiplier: float = 1.0,
 ) -> pd.DataFrame:
     """Compute UCS, tensile strength and friction angle with selectable methods.
 
@@ -635,7 +637,10 @@ def compute_rock_strength(
                 )
         elif np.isfinite(yme_sta[i]) and yme_sta[i] > 0:  # plumb
             ucs_psi[i] = conv.convert_yme_sta_to_ucs_plumb(yme_sta=float(yme_sta[i]))
-        # --- TSTR (always derived from UCS) ---
+        # --- UCS calibration multiplier (like the static YME multiplier) ---
+        if np.isfinite(ucs_psi[i]):
+            ucs_psi[i] = ucs_psi[i] * ucs_multiplier
+        # --- TSTR (always derived from the calibrated UCS) ---
         if np.isfinite(ucs_psi[i]):
             tstr_psi[i] = conv.convert_ucs_to_tstr(ucs=float(ucs_psi[i]), multiplier=tstr_multiplier)
         # --- FANG ---
@@ -1061,6 +1066,82 @@ def analyze_stress_barriers(
 
 
 # ---------------------------------------------------------------------------
+# NEW: Mechanical stratigraphy (GR-based lithology flag)
+# ---------------------------------------------------------------------------
+
+# Lithology codes requested: sandstone 0, shale 1, limestone 2, coal 6.
+LITHO_NAME_BY_CODE = {0: "Sandstone", 1: "Shale", 2: "Limestone", 6: "Coal"}
+LITHO_CODE_BY_NAME = {v: k for k, v in LITHO_NAME_BY_CODE.items()}
+# Display colours per code (+ -1 / NaN = undefined).
+LITHO_COLORS = {0: "#f4d03f", 1: "#7f8c8d", 2: "#5dade2", 6: "#17202a", -1: "#ecf0f1"}
+
+
+def default_litho_config() -> list[dict]:
+    """Default GR windows per lithology: [gr_min, gr_max) in gAPI, first match wins.
+
+    Order in this list is the classification priority. Defaults are ascending,
+    non-overlapping GR bins covering 0-250 gAPI; users recalibrate per field.
+    """
+    return [
+        {"name": "Coal", "code": 6, "gr_min": 0.0, "gr_max": 10.0},
+        {"name": "Sandstone", "code": 0, "gr_min": 10.0, "gr_max": 65.0},
+        {"name": "Limestone", "code": 2, "gr_min": 65.0, "gr_max": 90.0},
+        {"name": "Shale", "code": 1, "gr_min": 90.0, "gr_max": 250.0},
+    ]
+
+
+def classify_lithology_value(gr: float, config: list[dict]) -> float:
+    """First lithology window [gr_min, gr_max) containing gr; NaN if none/invalid."""
+    if not np.isfinite(gr):
+        return np.nan
+    for row in config:
+        lo = row.get("gr_min")
+        hi = row.get("gr_max")
+        lo = -np.inf if lo is None or (isinstance(lo, float) and not np.isfinite(lo)) else float(lo)
+        hi = np.inf if hi is None or (isinstance(hi, float) and not np.isfinite(hi)) else float(hi)
+        if lo <= gr < hi:
+            try:
+                return float(row["code"])
+            except (KeyError, TypeError, ValueError):
+                return np.nan
+    return np.nan
+
+
+def compute_mechanical_stratigraphy(df: pd.DataFrame, litho_config: list[dict] | None = None) -> pd.DataFrame:
+    """NEW: add a LITHO_CODE column classifying each sample from GR.
+
+    litho_config is a list of {name, code, gr_min, gr_max} rows (priority = order).
+    Samples not matching any window (or with missing GR) get NaN.
+    """
+    out = df.copy()
+    config = litho_config or default_litho_config()
+    gr = (
+        pd.to_numeric(out["GR"], errors="coerce").to_numpy(dtype=float)
+        if "GR" in out.columns
+        else np.full(len(out), np.nan)
+    )
+    out["LITHO_CODE"] = [classify_lithology_value(v, config) for v in gr]
+    return out
+
+
+def lithology_counts(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-lithology sample counts and fraction, for the stratigraphy summary."""
+    if "LITHO_CODE" not in df.columns:
+        return pd.DataFrame(columns=["Lithology", "Code", "Samples", "Fraction %"])
+    codes = pd.to_numeric(df["LITHO_CODE"], errors="coerce")
+    total = int(codes.notna().sum())
+    rows = []
+    for code, name in LITHO_NAME_BY_CODE.items():
+        cnt = int((codes == code).sum())
+        rows.append({"Lithology": name, "Code": code, "Samples": cnt,
+                     "Fraction %": round(100.0 * cnt / total, 1) if total else 0.0})
+    undef = int(codes.isna().sum())
+    if undef:
+        rows.append({"Lithology": "Undefined", "Code": -1, "Samples": undef, "Fraction %": 0.0})
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
 # Full pipeline + export
 # ---------------------------------------------------------------------------
 
@@ -1080,6 +1161,8 @@ def run_full_workflow(
     fang_constant_deg: float = 30.0,
     fang_gr_min: float = 15.0,
     fang_gr_max: float = 120.0,
+    ucs_multiplier: float = 1.0,
+    litho_config: list[dict] | None = None,
     stress_params: dict | None = None,
 ) -> pd.DataFrame:
     """Rename mapped columns to standard mnemonics, convert the input to
@@ -1117,7 +1200,10 @@ def run_full_workflow(
         fang_constant_deg=fang_constant_deg,
         fang_gr_min=fang_gr_min,
         fang_gr_max=fang_gr_max,
+        ucs_multiplier=ucs_multiplier,
     )
+    if litho_config is not None:  # None => user disabled lithology flagging
+        df = compute_mechanical_stratigraphy(df, litho_config)
     if stress_params is not None:
         df = compute_stress_profile(df, stress_params)
     return df
@@ -1177,6 +1263,8 @@ def run_tornado_analysis(
     fang_constant_deg: float = 30.0,
     fang_gr_min: float = 15.0,
     fang_gr_max: float = 120.0,
+    ucs_multiplier: float = 1.0,
+    litho_config: list[dict] | None = None,
     stress_params: dict | None = None,
 ) -> tuple[pd.DataFrame, float, list[str]]:
     """One-at-a-time sensitivity of a target output to the main inputs.
@@ -1212,6 +1300,8 @@ def run_tornado_analysis(
         fang_constant_deg=fang_constant_deg,
         fang_gr_min=fang_gr_min,
         fang_gr_max=fang_gr_max,
+        ucs_multiplier=ucs_multiplier,
+        litho_config=litho_config,
         stress_params=stress_params,
     )
 
