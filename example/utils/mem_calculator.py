@@ -208,7 +208,7 @@ def check_unit_sanity(data: pd.DataFrame, column_map: dict[str, str], unit_syste
 
 # QC validation ranges in CANONICAL units: column -> (min, max, unit).
 QC_RANGES = {
-    "GR": (0.0, 250.0, "gAPI"),
+    "GR": (0.0, 200.0, "gAPI"),
     "RHOB": (1.5, 3.2, "g/cc"),
     "DTCO": (40.0, 240.0, "us/ft"),
     "DTSM": (60.0, 450.0, "us/ft"),
