@@ -95,18 +95,25 @@ def depth_track_figure(df: pd.DataFrame, depth_col: str, tracks: list[tuple[str,
     fig.update_yaxes(autorange="reversed", title_text=depth_col, col=1)
     fig.update_layout(
         height=height,
-        legend=dict(orientation="h", yanchor="bottom", y=1.06),
-        margin=dict(t=90, b=40),
+        # legend well above the subplot titles so the two never overlap
+        legend=dict(orientation="h", yanchor="bottom", y=1.14),
+        margin=dict(t=120, b=40),
     )
     return fig
 
 
-def mud_window_figure(disp: pd.DataFrame, depth_col: str, N: dict[str, str], unit: str, height: int = 700) -> go.Figure:
-    """NEW: mud weight window plot — safe window shaded between the breakout
-    (shear failure) and breakdown (fracture) mud weight limits."""
+def mud_window_figure(disp: pd.DataFrame, depth_col: str, N: dict[str, str], unit: str, height: int = 720) -> go.Figure:
+    """NEW: mud weight window plot.
+
+    Safe window (green) is shaded between the breakout limit (min MW, shear
+    failure) and the LOSS GRADIENT (max MW = minimum principal stress among
+    Sv/SHmax/Shmin) — exceeding the loss gradient risks losses into
+    natural/reopened fractures. Breakdown (fracture initiation), Pp and Sv
+    are shown as reference lines.
+    """
     fig = go.Figure()
-    bo, bd = N.get("MW_BREAKOUT_GCC"), N.get("MW_BREAKDOWN_GCC")
-    if bo in disp.columns and bd in disp.columns:
+    bo, loss = N.get("MW_BREAKOUT_GCC"), N.get("MW_LOSS_GCC")
+    if bo in disp.columns and loss in disp.columns:
         fig.add_trace(
             go.Scatter(
                 x=disp[bo], y=disp[depth_col], mode="lines", name="Breakout limit (min MW)",
@@ -116,18 +123,18 @@ def mud_window_figure(disp: pd.DataFrame, depth_col: str, N: dict[str, str], uni
         )
         fig.add_trace(
             go.Scatter(
-                x=disp[bd], y=disp[depth_col], mode="lines", name="Breakdown limit (max MW)",
-                line=dict(color="#1f77b4"), fill="tonextx", fillcolor="rgba(40, 167, 69, 0.18)",
-                hovertemplate=f"Breakdown: %{{x:.3f}} {unit}<br>Depth: %{{y:.1f}}<extra></extra>",
+                x=disp[loss], y=disp[depth_col], mode="lines",
+                name="Loss gradient / min σ (max MW)",
+                line=dict(color="#6f42c1"), fill="tonextx", fillcolor="rgba(40, 167, 69, 0.18)",
+                hovertemplate=f"Loss gradient: %{{x:.3f}} {unit}<br>Depth: %{{y:.1f}}<extra></extra>",
             )
         )
-    extra_curves = [
+    reference_curves = [
+        ("MW_BREAKDOWN_GCC", "Breakdown limit (fracture)", "dashdot", "#1f77b4"),
         ("MW_PP_GCC", "Pore pressure EMW", "dot", "gray"),
         ("MW_SV_GCC", "Overburden EMW", "dash", "gray"),
-        # NEW: loss gradient = min principal stress (Sv, SHmax, Shmin) as EMW
-        ("MW_LOSS_GCC", "Loss gradient (min principal stress)", "dashdot", "#6f42c1"),
     ]
-    for canonical, label, dash, color in extra_curves:
+    for canonical, label, dash, color in reference_curves:
         col = N.get(canonical)
         if col in disp.columns:
             fig.add_trace(
@@ -141,9 +148,11 @@ def mud_window_figure(disp: pd.DataFrame, depth_col: str, N: dict[str, str], uni
     fig.update_layout(
         height=height,
         xaxis_title=f"Equivalent mud weight ({unit})",
-        legend=dict(orientation="h", yanchor="bottom", y=1.04),
-        margin=dict(t=80, b=40),
-        title="Mud weight window (green = safe drilling window)",
+        # title at the very top, legend BELOW the plot -> no overlap
+        title=dict(text="Mud weight window (green = safe window: breakout → loss gradient)",
+                   y=0.98, yanchor="top"),
+        legend=dict(orientation="h", yanchor="top", y=-0.12),
+        margin=dict(t=60, b=90),
     )
     return fig
 
@@ -502,6 +511,14 @@ else:
     disp, N, flags_disp, DEPTH, has_stress, has_litho = None, {}, None, None, False, False
 
 
+def with_litho(cols: list[str]) -> list[str]:
+    """Insert the lithology display column right after DEPTH when available,
+    so every results table shows lithology next to the output properties."""
+    if has_litho and N.get("LITHO_CODE") and N["LITHO_CODE"] not in cols:
+        return [cols[0], N["LITHO_CODE"]] + cols[1:]
+    return cols
+
+
 def lithology_figure(depth_series, code_series, height: int = 650, title: str = "Lithology (from GR)") -> go.Figure:
     """Colored lithology strip vs depth (contiguous runs shaded by code)."""
     depth = pd.to_numeric(depth_series, errors="coerce").to_numpy(dtype=float)
@@ -684,7 +701,7 @@ with tab_ovb:
         )
         litho_expander("ovb")
         ovb_cols = [DEPTH] + [N[c] for c in ["SV_MPA", "PP_MPA", "MW_SV_GCC", "MW_PP_GCC"]]
-        st.dataframe(style_flags(disp, flags_disp, ovb_cols), use_container_width=True, height=380)
+        st.dataframe(style_flags(disp, flags_disp, with_litho(ovb_cols)), use_container_width=True, height=380)
         mw_unit = mc.display_unit("MW_PP_GCC", unit_system)
         st.plotly_chart(
             depth_track_figure(
@@ -713,11 +730,11 @@ with tab_rock:
 
         st.markdown("**Dynamic elastic properties** (from DTCO / DTSM / RHOB)")
         dyn_cols = [DEPTH] + [N[c] for c in ["VP_MS", "VS_MS", "VPVS", "YME_DYN_GPA", "PR_DYN", "K_DYN_GPA", "G_DYN_GPA", "LAME_DYN_GPA", "M_DYN_GPA"]]
-        st.dataframe(style_flags(disp, flags_disp, dyn_cols), use_container_width=True, height=300)
+        st.dataframe(style_flags(disp, flags_disp, with_litho(dyn_cols)), use_container_width=True, height=300)
 
         st.markdown("**Static elastic + rock strength**")
         sta_cols = [DEPTH] + [N[c] for c in ["YME_DYN_GPA", "YME_STA_GPA", "PR_DYN", "PR_STA", "UCS_MPA", "TSTR_MPA", "FANG_DEG"]]
-        st.dataframe(style_flags(disp, flags_disp, sta_cols), use_container_width=True, height=300)
+        st.dataframe(style_flags(disp, flags_disp, with_litho(sta_cols)), use_container_width=True, height=300)
 
         st.plotly_chart(
             depth_track_figure(
@@ -752,7 +769,7 @@ with tab_hstress:
         )
         litho_expander("hstress")
         hs_cols = [DEPTH] + [N[c] for c in ["SV_MPA", "PP_MPA", "SHMIN_MPA", "SHMAX_MPA", "Q_FACTOR", "SH_RATIO"]]
-        st.dataframe(style_flags(disp, flags_disp, hs_cols), use_container_width=True, height=380)
+        st.dataframe(style_flags(disp, flags_disp, with_litho(hs_cols)), use_container_width=True, height=380)
 
         q_med = pd.to_numeric(results["Q_FACTOR"], errors="coerce").median()
         if pd.notna(q_med):
@@ -786,29 +803,30 @@ with tab_wbs:
         st.subheader(f"Wellbore stability — vertical well ({unit_system})")
         st.caption(
             "Breakout limit: Mohr-Coulomb shear failure (Kirsch, analytical) — drilling below it risks breakouts. "
-            "Breakdown limit: fracture initiation (Hubbert & Willis) — drilling above it risks losses. "
-            "Loss gradient: minimum principal stress among Sv, SHmax and Shmin. "
-            "The green band is the safe mud weight window."
+            "Loss gradient: minimum principal stress among Sv, SHmax and Shmin — drilling above it risks losses. "
+            "The green band is the safe mud weight window (**breakout limit → loss gradient**). "
+            "Breakdown (fracture initiation, Hubbert & Willis) is shown as a reference only."
         )
         litho_expander("wbs")
 
         mw_unit = mc.display_unit("MW_BREAKOUT_GCC", unit_system)
-        window = results["MW_BREAKDOWN_GCC"] - results["MW_BREAKOUT_GCC"]
+        # Safe window: breakout (lower bound) up to the loss gradient (upper bound = min principal stress)
+        window = results["MW_LOSS_GCC"] - results["MW_BREAKOUT_GCC"]
         n_valid = int(window.notna().sum())
         n_closed = int((window < 0).sum())
         c1, c2, c3 = st.columns(3)
         factor = mc.PPG_PER_GCC if unit_system == mc.OILFIELD else 1.0
         c1.metric(f"Median breakout limit ({mw_unit})", f"{results['MW_BREAKOUT_GCC'].median() * factor:.2f}")
-        c2.metric(f"Median breakdown limit ({mw_unit})", f"{results['MW_BREAKDOWN_GCC'].median() * factor:.2f}")
+        c2.metric(f"Median loss gradient ({mw_unit})", f"{results['MW_LOSS_GCC'].median() * factor:.2f}")
         c3.metric(f"Median window width ({mw_unit})", f"{window.median() * factor:.2f}")
         if n_closed:
             st.warning(
-                f"⚠️ The mud weight window is closed (breakout limit above breakdown limit) at "
+                f"⚠️ The mud weight window is closed (breakout limit above the loss gradient) at "
                 f"{n_closed} of {n_valid} depth samples — no safe static mud weight exists there."
             )
 
         wbs_cols = [DEPTH] + [N[c] for c in ["PW_BREAKOUT_MPA", "PW_BREAKDOWN_MPA", "LOSS_P_MPA", "MW_BREAKOUT_GCC", "MW_BREAKDOWN_GCC", "MW_LOSS_GCC", "MW_PP_GCC", "MW_SV_GCC"]]
-        st.dataframe(style_flags(disp, flags_disp, wbs_cols), use_container_width=True, height=380)
+        st.dataframe(style_flags(disp, flags_disp, with_litho(wbs_cols)), use_container_width=True, height=380)
         st.plotly_chart(mud_window_figure(disp, DEPTH, N, mw_unit), use_container_width=True)
 
 # --- Tab 7: QC & Results ----------------------------------------------------
@@ -842,7 +860,7 @@ with tab_qc:
         if flagged_canonical:
             st.markdown("**Flagged samples** (rows where at least one curve is out of range or missing):")
             bad_rows = flags[flagged_canonical].ne("OK").any(axis=1)
-            show_cols = [DEPTH] + [N[c] for c in flagged_canonical if c in N]
+            show_cols = with_litho([DEPTH] + [N[c] for c in flagged_canonical if c in N])
             st.dataframe(
                 style_flags(disp.loc[bad_rows], flags_disp.loc[bad_rows], show_cols),
                 use_container_width=True,
