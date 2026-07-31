@@ -150,7 +150,8 @@ def depth_track_figure(df: pd.DataFrame, depth_col: str, tracks: list[tuple[str,
     return fig
 
 
-def mud_window_figure(disp: pd.DataFrame, depth_col: str, N: dict[str, str], unit: str, height: int = 720, litho_codes=None) -> go.Figure:
+def mud_window_figure(disp: pd.DataFrame, depth_col: str, N: dict[str, str], unit: str, height: int = 720,
+                      litho_codes=None, mw_line=None, ecd_line=None, casing_depths=None) -> go.Figure:
     """NEW: mud weight window plot.
 
     Safe window (green) is shaded between the breakout limit (min MW, shear
@@ -192,6 +193,29 @@ def mud_window_figure(disp: pd.DataFrame, depth_col: str, N: dict[str, str], uni
     _line("MW_PP_GCC", "Pore pressure EMW", "gray", dash="dot")
     _line("MW_SV_GCC", "Overburden EMW", "gray", dash="dash")
 
+    # (5) user-planned MW and ECD as vertical lines (move via the tab sliders)
+    depth_vals = pd.to_numeric(disp[depth_col], errors="coerce")
+    y_top, y_bot = float(depth_vals.min()), float(depth_vals.max())
+    if mw_line is not None:
+        fig.add_trace(
+            go.Scatter(x=[mw_line, mw_line], y=[y_top, y_bot], mode="lines",
+                       name=f"MW = {mw_line:.2f} {unit}", line=dict(color="#0b6e4f", width=3)),
+            row=1, col=mw_col,
+        )
+    if ecd_line is not None:
+        fig.add_trace(
+            go.Scatter(x=[ecd_line, ecd_line], y=[y_top, y_bot], mode="lines",
+                       name=f"ECD = {ecd_line:.2f} {unit}", line=dict(color="#e67e22", width=3, dash="dash")),
+            row=1, col=mw_col,
+        )
+    # (5) casing setting depths as horizontal lines
+    for k, cd in enumerate(casing_depths or []):
+        fig.add_hline(y=cd, line=dict(color="#111", width=1.5, dash="dot"), row=1, col=mw_col)
+        fig.add_annotation(x=1.0, xref="x domain", y=cd, yref="y", showarrow=False,
+                           text=f"Casing {k + 1}: {cd:g}", font=dict(size=10, color="#111"),
+                           bgcolor="rgba(255,255,255,0.6)", xanchor="right", yanchor="bottom",
+                           row=1, col=mw_col)
+
     fig.update_yaxes(autorange="reversed", title_text=depth_col, col=1)
     fig.update_xaxes(title_text=f"Equivalent mud weight ({unit})", row=1, col=mw_col)
     fig.update_layout(
@@ -215,261 +239,227 @@ with st.sidebar:
         "1D Mechanical Earth Model builder powered by "
         "[geomechpy](https://github.com/sohwaisheng1/GeomechPy_WS)."
     )
-    st.divider()
 
-    st.header("1. Units")
-    unit_system = st.selectbox(
-        "Input/Output Units",
-        mc.UNIT_SYSTEMS,
-        index=0,
-        help="Controls how the uploaded data is interpreted AND how results are displayed.",
-    )
-    depth_unit = st.radio(
-        "Depth (MD) unit",
-        mc.DEPTH_UNITS,
-        index=0,
-        horizontal=True,
-        help="Unit of the depth column. MD is assumed ≈ TVD (vertical well) for the stress calculations.",
-    )
-    expected = dict(mc.INPUT_UNITS[unit_system])
-    expected["DEPTH"] = depth_unit
-    st.caption(
-        "Expected input units — "
-        + " · ".join(f"{curve}: {unit}" for curve, unit in expected.items())
-    )
-
-    st.divider()
-    st.header("2. Data input")
-    uploaded = st.file_uploader(
-        "Upload well log data (CSV / Excel)",
-        type=["csv", "txt", "xls", "xlsx"],
-        help="One row per depth sample. Required curves: DEPTH/MD, GR, RHOB, DTCO, DTSM. "
-        "POROSITY is optional. Unit rows under the header and -999.25/-9999 nulls are handled automatically.",
-    )
-    if uploaded is not None:
-        try:
-            st.session_state.raw_df, st.session_state.load_messages = mc.load_data(uploaded)
-            st.session_state.data_source = f"📄 {uploaded.name}"
-        except ValueError as exc:
-            st.error(str(exc))
-
-    if st.button("🧪 Load Sample Data", use_container_width=True):
-        st.session_state.raw_df = mc.generate_sample_data(unit_system=unit_system)
-        st.session_state.data_source = f"🧪 Synthetic sample well (2500-3000 m, {unit_system.lower()})"
-        st.session_state.load_messages = []
-
-    st.download_button(
-        "⬇️ Download Example File",
-        data=mc.sample_csv_bytes(unit_system=unit_system),
-        file_name="mem_example_data.csv",
-        mime="text/csv",
-        use_container_width=True,
-        help=f"Clean sample CSV (MD, GR, RHOB, DTCO, DTSM, POROSITY) in {unit_system.lower()}.",
-    )
-
-    if st.session_state.data_source:
-        st.success(f"Loaded: {st.session_state.data_source}")
-    for msg in st.session_state.load_messages:
-        st.info(msg)
-    if st.session_state.raw_df is not None:
-        undetected = mc.missing_required_curves(list(st.session_state.raw_df.columns))
-        if undetected:
-            st.warning(
-                "Could not auto-detect column(s) for: "
-                + ", ".join(undetected)
-                + ". Map them manually below or check your file."
-            )
-
-    st.divider()
-    st.header("3. Column mapping")
-    column_map: dict[str, str] = {}
-    if st.session_state.raw_df is not None:
-        options = ["-- not mapped --"] + list(st.session_state.raw_df.columns)
-        for curve in mc.ALL_CURVES:
-            required = curve in mc.REQUIRED_CURVES
-            label = f"{curve} [{expected[curve]}] {'(required)' if required else '(optional)'}"
-            choice = st.selectbox(
-                label,
-                options,
-                index=mc.guess_column(curve, list(st.session_state.raw_df.columns)),
-                key=f"map_{curve}",
-            )
-            column_map[curve] = "" if choice == "-- not mapped --" else choice
-    else:
-        st.info("Load data first to map columns.")
-
-    st.divider()
-    st.header("4. Static properties")
-    method_label = st.selectbox(
-        "Dynamic → static YME correlation",
-        list(mc.STATIC_YME_METHODS.keys()),
-        help="Correlations from geomechpy.static_elastic_properties. "
-        "Morales additionally requires a mapped POROSITY column.",
-    )
-    calibration_multiplier = st.slider(
-        "Static YME calibration multiplier",
-        min_value=0.5,
-        max_value=2.0,
-        value=1.0,
-        step=0.05,
-        help="Scales the correlation output — use it to calibrate against core test data.",
-    )
-    pr_multiplier = st.slider(
-        "Static Poisson's ratio multiplier",
-        min_value=0.5,
-        max_value=2.0,
-        value=1.0,
-        step=0.05,
-    )
-    custom_a, custom_b = 0.5, 1.0
-    if "power" in method_label:
-        custom_a = st.number_input("Custom multiplier a", value=0.5, format="%.4f")
-        custom_b = st.number_input("Custom exponent b", value=1.0, format="%.4f")
-    elif "linear" in method_label:
-        custom_a = st.number_input("Custom slope a", value=0.8, format="%.4f")
-        custom_b = st.number_input("Custom intercept b (Mpsi)", value=0.0, format="%.4f")
-
-    st.divider()
-    st.header("5. Rock strength")
-    # NEW: selectable UCS / FANG methods
-    ucs_method_label = st.selectbox(
-        "UCS method",
-        list(mc.UCS_METHODS.keys()),
-        help="All UCS correlations available in geomechpy.rock_strength (currently Plumb 1994), "
-        "plus a constant-value fallback for calibration.",
-    )
-    ucs_method = mc.UCS_METHODS[ucs_method_label]
-    ucs_constant_mpa = 50.0
-    if ucs_method == "constant":
-        ucs_constant_mpa = st.number_input("Constant UCS (MPa)", value=50.0, min_value=0.1, format="%.1f")
-    fang_method_label = st.selectbox(
-        "Friction angle method",
-        list(mc.FANG_METHODS.keys()),
-        help="All FANG correlations available in geomechpy.rock_strength (currently Lal 1999), "
-        "plus a constant-value fallback for calibration.",
-    )
-    fang_method = mc.FANG_METHODS[fang_method_label]
-    fang_constant_deg = 30.0
-    fang_gr_min, fang_gr_max = 15.0, 120.0
-    if fang_method == "constant":
-        fang_constant_deg = st.number_input("Constant friction angle (deg)", value=30.0, min_value=1.0, max_value=60.0, format="%.1f")
-    elif fang_method == "gr_linear":
-        cgr1, cgr2 = st.columns(2)
-        fang_gr_min = cgr1.number_input("GR min (clean sand, gAPI)", value=15.0, format="%.1f",
-                                        help="GR at clean sand → FANG = 45°.")
-        fang_gr_max = cgr2.number_input("GR max (pure shale, gAPI)", value=120.0, format="%.1f",
-                                        help="GR at pure shale → FANG = 15°. Must differ from GR min.")
-    ucs_multiplier = st.slider(
-        "UCS calibration multiplier",
-        min_value=0.5,
-        max_value=2.0,
-        value=1.0,
-        step=0.05,
-        help="Scales the UCS output (and TSTR derived from it) — calibrate against core test data, "
-        "just like the static YME multiplier.",
-    )
-    tstr_multiplier = st.slider(
-        "Tensile strength / UCS ratio",
-        min_value=0.05,
-        max_value=0.30,
-        value=0.15,
-        step=0.01,
-        help="TSTR = ratio × UCS (geomechpy default is 0.15).",
-    )
-
-    st.divider()
-    st.header("6. Mechanical stratigraphy")
-    # NEW: GR-based lithology flag with user-defined cutoffs
-    compute_litho = st.checkbox(
-        "Flag lithology from GR",
-        value=True,
-        help="Classify each sample into sandstone (0), shale (1), limestone (2) or coal (6) "
-        "using GR windows. The flag is shown on the stratigraphy tab and alongside the "
-        "computation tabs.",
-    )
-    litho_config = None
-    if compute_litho:
+    # (4) Sidebar sections 1-7 are collapsible via st.expander.
+    with st.expander("1. Units", expanded=True):
+        unit_system = st.selectbox(
+            "Input/Output Units",
+            mc.UNIT_SYSTEMS,
+            index=0,
+            help="Controls how the uploaded data is interpreted AND how results are displayed. "
+            "Note: YME, UCS, TSTR, Sv, Pp, Shmin and SHmax are always shown in psi.",
+        )
+        depth_unit = st.radio(
+            "Depth (MD) unit",
+            mc.DEPTH_UNITS,
+            index=0,
+            horizontal=True,
+            help="Unit of the depth column. MD is assumed ≈ TVD (vertical well) for the stress calculations.",
+        )
+        expected = dict(mc.INPUT_UNITS[unit_system])
+        expected["DEPTH"] = depth_unit
         st.caption(
-            "Define the GR window [min, max) gAPI for each lithology. First matching row wins "
-            "(priority = top to bottom). Samples matching none are 'Undefined'."
+            "Expected input units — "
+            + " · ".join(f"{curve}: {unit}" for curve, unit in expected.items())
         )
-        litho_editor = st.data_editor(
-            pd.DataFrame(mc.default_litho_config()),
-            column_config={
-                "name": st.column_config.TextColumn("Lithology", disabled=True),
-                "code": st.column_config.NumberColumn("Code", disabled=True),
-                "gr_min": st.column_config.NumberColumn("GR min", min_value=0.0, step=1.0, format="%.1f"),
-                "gr_max": st.column_config.NumberColumn("GR max", min_value=0.0, step=1.0, format="%.1f"),
-            },
-            hide_index=True,
-            num_rows="fixed",
-            use_container_width=True,
-            key="litho_editor",
-        )
-        litho_config = litho_editor.to_dict("records")
 
-    st.divider()
-    st.header("7. Stress & wellbore stability")
-    # NEW: overburden / pore pressure / horizontal stress / stability inputs
-    compute_stress = st.checkbox(
-        "Compute stresses & mud weight window",
-        value=True,
-        help="Adds overburden, pore pressure, horizontal stresses and the vertical-well "
-        "mud weight window (geomechpy gradient-based + poroelastic methods).",
-    )
-    stress_params = None
-    if compute_stress:
-        setting = st.radio("Well setting", mc.WELL_SETTINGS, horizontal=True)
-        air_gap = st.number_input(
-            f"Air gap / KB elevation ({depth_unit})", value=0.0, min_value=0.0, format="%.1f",
-            help="Drill floor to ground level (onshore) or to mean sea level (offshore).",
+    with st.expander("2. Data input", expanded=True):
+        uploaded = st.file_uploader(
+            "Upload well log data (LAS / CSV / Excel)",
+            type=["las", "csv", "txt", "xls", "xlsx"],
+            help="One row per depth sample. LAS files are read with lasio and their curves "
+            "auto-extracted. Required curves: DEPTH/MD, GR, RHOB, DTCO, DTSM. POROSITY is "
+            "optional. Unit rows and -999.25/-9999 nulls are handled automatically.",
         )
-        water_depth, sea_gradient = 0.0, 0.47
-        if setting == "Offshore":
-            water_depth = st.number_input(f"Water depth ({depth_unit})", value=0.0, min_value=0.0, format="%.1f")
-            sea_gradient = st.number_input("Sea water gradient (psi/ft)", value=0.47, min_value=0.30, max_value=0.60, format="%.3f")
-        ovb_source_label = st.selectbox(
-            "Overburden gradient source",
-            list(mc.OVB_GRADIENT_SOURCES.keys()),
-            help="Constant lithostatic gradient, or a gradient derived from the mean of the "
-            "mapped RHOB log (mean g/cc × 0.4335 psi/ft).",
+        if uploaded is not None:
+            try:
+                st.session_state.raw_df, st.session_state.load_messages = mc.load_data(uploaded)
+                st.session_state.data_source = f"📄 {uploaded.name}"
+            except ValueError as exc:
+                st.error(str(exc))
+
+        if st.button("🧪 Load Sample Data", use_container_width=True):
+            st.session_state.raw_df = mc.generate_sample_data(unit_system=unit_system)
+            st.session_state.data_source = f"🧪 Synthetic sample well (2500-3000 m, {unit_system.lower()})"
+            st.session_state.load_messages = []
+
+        st.download_button(
+            "⬇️ Download Example File",
+            data=mc.sample_csv_bytes(unit_system=unit_system),
+            file_name="mem_example_data.csv",
+            mime="text/csv",
+            use_container_width=True,
+            help=f"Clean sample CSV (MD, GR, RHOB, DTCO, DTSM, POROSITY) in {unit_system.lower()}.",
         )
-        ovb_source = mc.OVB_GRADIENT_SOURCES[ovb_source_label]
-        ovb_gradient = st.number_input(
-            "Lithostatic gradient (psi/ft)", value=1.05, min_value=0.5, max_value=1.5, format="%.3f",
-            disabled=(ovb_source == "density"),
-            help="Typical 1.0–1.1 psi/ft. Ignored when the gradient is derived from RHOB.",
+
+        if st.session_state.data_source:
+            st.success(f"Loaded: {st.session_state.data_source}")
+        for msg in st.session_state.load_messages:
+            st.info(msg)
+        if st.session_state.raw_df is not None:
+            undetected = mc.missing_required_curves(list(st.session_state.raw_df.columns))
+            if undetected:
+                st.warning(
+                    "Could not auto-detect column(s) for: "
+                    + ", ".join(undetected)
+                    + ". Map them manually below or check your file."
+                )
+
+    with st.expander("3. Column mapping", expanded=True):
+        column_map: dict[str, str] = {}
+        if st.session_state.raw_df is not None:
+            options = ["-- not mapped --"] + list(st.session_state.raw_df.columns)
+            for curve in mc.ALL_CURVES:
+                required = curve in mc.REQUIRED_CURVES
+                label = f"{curve} [{expected[curve]}] {'(required)' if required else '(optional)'}"
+                choice = st.selectbox(
+                    label,
+                    options,
+                    index=mc.guess_column(curve, list(st.session_state.raw_df.columns)),
+                    key=f"map_{curve}",
+                )
+                column_map[curve] = "" if choice == "-- not mapped --" else choice
+        else:
+            st.info("Load data first to map columns.")
+
+    with st.expander("4. Static properties", expanded=False):
+        method_label = st.selectbox(
+            "Dynamic → static YME correlation",
+            list(mc.STATIC_YME_METHODS.keys()),
+            help="Correlations from geomechpy.static_elastic_properties. "
+            "Morales additionally requires a mapped POROSITY column.",
         )
-        pp_gradient = st.number_input(
-            "Pore pressure gradient (psi/ft)", value=0.47, min_value=0.30, max_value=1.0, format="%.3f",
-            help="Hydrostatic ≈ 0.433–0.47 psi/ft; higher = overpressure.",
+        calibration_multiplier = st.slider(
+            "Static YME calibration multiplier",
+            min_value=0.5, max_value=2.0, value=1.0, step=0.05,
+            help="Scales the correlation output — use it to calibrate against core test data.",
         )
-        shmax_method_label = st.selectbox("SHmax method", list(mc.SHMAX_METHODS.keys()))
-        shmax_method = mc.SHMAX_METHODS[shmax_method_label]
-        shmax_multiplier = 1.1
-        if shmax_method == "multiplier":
-            shmax_multiplier = st.slider("SHmax / Shmin multiplier", 1.0, 2.0, 1.1, 0.05)
-        biot = st.slider("Biot coefficient", 0.5, 1.0, 1.0, 0.05)
-        c_ex, c_ey = st.columns(2)
-        ex = c_ex.number_input("Tectonic strain EX", value=0.0001, format="%.5f",
-                               help="Poroelastic tectonic strain term (Shmin direction).")
-        ey = c_ey.number_input("Tectonic strain EY", value=0.009, format="%.5f",
-                               help="Poroelastic tectonic strain term (SHmax direction). Keep EY ≥ EX.")
-        stress_params = {
-            "setting": setting,
-            "depth_unit": depth_unit,
-            "air_gap": air_gap,
-            "water_depth": water_depth,
-            "sea_gradient_psift": sea_gradient,
-            "ovb_source": ovb_source,
-            "ovb_gradient_psift": ovb_gradient,
-            "pp_gradient_psift": pp_gradient,
-            "shmax_method": shmax_method,
-            "shmax_multiplier": shmax_multiplier,
-            "biot": biot,
-            "ex": ex,
-            "ey": ey,
-        }
+        pr_multiplier = st.slider(
+            "Static Poisson's ratio multiplier",
+            min_value=0.5, max_value=2.0, value=1.0, step=0.05,
+        )
+        custom_a, custom_b = 0.5, 1.0
+        if "power" in method_label:
+            custom_a = st.number_input("Custom multiplier a", value=0.5, format="%.4f")
+            custom_b = st.number_input("Custom exponent b", value=1.0, format="%.4f")
+        elif "linear" in method_label:
+            custom_a = st.number_input("Custom slope a", value=0.8, format="%.4f")
+            custom_b = st.number_input("Custom intercept b (Mpsi)", value=0.0, format="%.4f")
+
+    with st.expander("5. Rock strength", expanded=False):
+        ucs_method_label = st.selectbox(
+            "UCS method",
+            list(mc.UCS_METHODS.keys()),
+            help="All UCS correlations available in geomechpy.rock_strength, plus a constant-value fallback.",
+        )
+        ucs_method = mc.UCS_METHODS[ucs_method_label]
+        ucs_constant_mpa = 50.0
+        if ucs_method == "constant":
+            ucs_constant_mpa = st.number_input("Constant UCS (MPa)", value=50.0, min_value=0.1, format="%.1f")
+        fang_method_label = st.selectbox(
+            "Friction angle method",
+            list(mc.FANG_METHODS.keys()),
+            help="All FANG correlations available in geomechpy.rock_strength, plus a constant-value fallback.",
+        )
+        fang_method = mc.FANG_METHODS[fang_method_label]
+        fang_constant_deg = 30.0
+        fang_gr_min, fang_gr_max = 15.0, 120.0
+        if fang_method == "constant":
+            fang_constant_deg = st.number_input("Constant friction angle (deg)", value=30.0, min_value=1.0, max_value=60.0, format="%.1f")
+        elif fang_method == "gr_linear":
+            cgr1, cgr2 = st.columns(2)
+            fang_gr_min = cgr1.number_input("GR min (clean sand, gAPI)", value=15.0, format="%.1f",
+                                            help="GR at clean sand → FANG = 45°.")
+            fang_gr_max = cgr2.number_input("GR max (pure shale, gAPI)", value=120.0, format="%.1f",
+                                            help="GR at pure shale → FANG = 15°. Must differ from GR min.")
+        ucs_multiplier = st.slider(
+            "UCS calibration multiplier",
+            min_value=0.5, max_value=2.0, value=1.0, step=0.05,
+            help="Scales the UCS output (and TSTR derived from it) — calibrate against core, "
+            "like the static YME multiplier.",
+        )
+        tstr_multiplier = st.slider(
+            "Tensile strength / UCS ratio",
+            min_value=0.05, max_value=0.30, value=0.15, step=0.01,
+            help="TSTR = ratio × UCS (geomechpy default is 0.15).",
+        )
+
+    with st.expander("6. Mechanical stratigraphy", expanded=False):
+        # (2) Simplified lithology: one GR cutoff -> sandstone (0) vs shale (1)
+        compute_litho = st.checkbox(
+            "Flag lithology from GR",
+            value=True,
+            help="Split each sample into sandstone (0) or shale (1) with a single GR cutoff. "
+            "The flag is shown on the stratigraphy tab and as a track on every output plot.",
+        )
+        gr_cutoff = None
+        if compute_litho:
+            gr_cutoff = st.slider(
+                "GR cutoff (gAPI)",
+                min_value=0.0, max_value=200.0, value=mc.DEFAULT_GR_CUTOFF, step=1.0,
+                help="GR below the cutoff = sandstone (0); at or above = shale (1).",
+            )
+
+    with st.expander("7. Stress & wellbore stability", expanded=False):
+        compute_stress = st.checkbox(
+            "Compute stresses & mud weight window",
+            value=True,
+            help="Adds overburden, pore pressure, horizontal stresses and the vertical-well "
+            "mud weight window (geomechpy gradient-based + poroelastic methods).",
+        )
+        stress_params = None
+        if compute_stress:
+            setting = st.radio("Well setting", mc.WELL_SETTINGS, horizontal=True)
+            air_gap = st.number_input(
+                f"Air gap / KB elevation ({depth_unit})", value=0.0, min_value=0.0, format="%.1f",
+                help="Drill floor to ground level (onshore) or to mean sea level (offshore).",
+            )
+            water_depth, sea_gradient = 0.0, 0.47
+            if setting == "Offshore":
+                water_depth = st.number_input(f"Water depth ({depth_unit})", value=0.0, min_value=0.0, format="%.1f")
+                sea_gradient = st.number_input("Sea water gradient (psi/ft)", value=0.47, min_value=0.30, max_value=0.60, format="%.3f")
+            ovb_source_label = st.selectbox(
+                "Overburden gradient source",
+                list(mc.OVB_GRADIENT_SOURCES.keys()),
+                help="Constant lithostatic gradient, or a gradient derived from the mean of the "
+                "mapped RHOB log (mean g/cc × 0.4335 psi/ft).",
+            )
+            ovb_source = mc.OVB_GRADIENT_SOURCES[ovb_source_label]
+            ovb_gradient = st.number_input(
+                "Lithostatic gradient (psi/ft)", value=1.05, min_value=0.5, max_value=1.5, format="%.3f",
+                disabled=(ovb_source == "density"),
+                help="Typical 1.0–1.1 psi/ft. Ignored when the gradient is derived from RHOB.",
+            )
+            pp_gradient = st.number_input(
+                "Pore pressure gradient (psi/ft)", value=0.47, min_value=0.30, max_value=1.0, format="%.3f",
+                help="Hydrostatic ≈ 0.433–0.47 psi/ft; higher = overpressure.",
+            )
+            shmax_method_label = st.selectbox("SHmax method", list(mc.SHMAX_METHODS.keys()))
+            shmax_method = mc.SHMAX_METHODS[shmax_method_label]
+            shmax_multiplier = 1.1
+            if shmax_method == "multiplier":
+                shmax_multiplier = st.slider("SHmax / Shmin multiplier", 1.0, 2.0, 1.1, 0.05)
+            biot = st.slider("Biot coefficient", 0.5, 1.0, 1.0, 0.05)
+            c_ex, c_ey = st.columns(2)
+            ex = c_ex.number_input("Tectonic strain EX", value=0.0001, format="%.5f",
+                                   help="Poroelastic tectonic strain term (Shmin direction).")
+            ey = c_ey.number_input("Tectonic strain EY", value=0.009, format="%.5f",
+                                   help="Poroelastic tectonic strain term (SHmax direction). Keep EY ≥ EX.")
+            stress_params = {
+                "setting": setting,
+                "depth_unit": depth_unit,
+                "air_gap": air_gap,
+                "water_depth": water_depth,
+                "sea_gradient_psift": sea_gradient,
+                "ovb_source": ovb_source,
+                "ovb_gradient_psift": ovb_gradient,
+                "pp_gradient_psift": pp_gradient,
+                "shmax_method": shmax_method,
+                "shmax_multiplier": shmax_multiplier,
+                "biot": biot,
+                "ex": ex,
+                "ey": ey,
+            }
 
     st.divider()
     run_clicked = st.button(
@@ -495,7 +485,7 @@ workflow_settings = dict(
     fang_gr_min=fang_gr_min,
     fang_gr_max=fang_gr_max,
     ucs_multiplier=ucs_multiplier,
-    litho_config=litho_config,
+    gr_cutoff=gr_cutoff,
     stress_params=stress_params,
 )
 
@@ -525,6 +515,12 @@ if run_clicked:
 # ---------------------------------------------------------------------------
 # Main area
 # ---------------------------------------------------------------------------
+
+st.title("Quick MEM Calculator")
+st.markdown(
+    "Build a quick-look **Mechanical Earth Model** from standard well logs: "
+    "dynamic → static properties → rock strength → stresses → mud weight window, with built-in QC."
+)
 
 for warning in st.session_state.unit_warnings:
     st.warning(f"⚠️ Unit check: {warning}")
@@ -685,9 +681,9 @@ with tab_input:
 with tab_strat:
     st.subheader("Mechanical Stratigraphy")
     st.markdown(
-        "Each depth is flagged into a lithology from **GR** using the cutoff windows defined in the "
-        "sidebar (**6. Mechanical stratigraphy**): sandstone (code 0), shale (1), limestone (2), coal (6). "
-        "The flag is carried through and shown alongside the computation tabs."
+        "Each depth is flagged from **GR** using the single cutoff defined in the sidebar "
+        "(**6. Mechanical stratigraphy**): GR below the cutoff = **sandstone (code 0)**, at or above "
+        "= **shale (code 1)**. The flag is carried through and shown as a track on every output plot."
     )
     if results is None:
         st.info("Run the calculation from the sidebar to generate the lithology flag.")
@@ -857,8 +853,74 @@ with tab_wbs:
             )
 
         wbs_cols = [DEPTH] + [N[c] for c in ["PW_BREAKOUT_MPA", "PW_BREAKDOWN_MPA", "LOSS_P_MPA", "MW_BREAKOUT_GCC", "MW_BREAKDOWN_GCC", "MW_LOSS_GCC", "MW_PP_GCC", "MW_SV_GCC"]]
-        st.dataframe(style_flags(disp, flags_disp, with_litho(wbs_cols)), use_container_width=True, height=380)
-        st.plotly_chart(mud_window_figure(disp, DEPTH, N, mw_unit, litho_codes=litho_arg), use_container_width=True)
+        st.dataframe(style_flags(disp, flags_disp, with_litho(wbs_cols)), use_container_width=True, height=340)
+
+        # (5) Interactive mud-weight planning: MW + ECD sliders and casing setting depths.
+        st.markdown("#### 🛠️ Mud weight planning")
+        bo_disp = results["MW_BREAKOUT_GCC"] * factor  # display MW units (ppg or g/cc)
+        loss_disp = results["MW_LOSS_GCC"] * factor
+        lo = float(np.nanmin(bo_disp)) if bo_disp.notna().any() else 8.0
+        hi = float(np.nanmax(loss_disp)) if loss_disp.notna().any() else 18.0
+        pad = max(0.5, 0.1 * (hi - lo))
+        slo, shi = round(lo - pad, 1), round(hi + pad, 1)
+        mid = round((lo + hi) / 2, 2)
+        step = 0.05 if unit_system == mc.OILFIELD else 0.01
+
+        cmw, cecd = st.columns(2)
+        mw_value = cmw.slider(
+            f"Mud weight — MW ({mw_unit})", slo, shi, value=mid, step=step, key="wbs_mw",
+            help="Planned static mud weight. Slide left/right to move the green MW line on the plot; "
+            "keep it inside the safe window (breakout → loss gradient).",
+        )
+        ecd_value = cecd.slider(
+            f"Equivalent circulating density — ECD ({mw_unit})", slo, shi + pad,
+            value=round(min(mw_value + (0.3 if unit_system == mc.OILFIELD else 0.04), shi + pad), 2),
+            step=step, key="wbs_ecd",
+            help="Dynamic (circulating) density. Slide to move the orange ECD line; keep it below the loss gradient.",
+        )
+
+        st.caption(
+            "**Casing setting depths** — add one row per casing shoe. These depths split the well into "
+            "sections and draw horizontal markers on the plot to help pick MW per section."
+        )
+        casing_default = pd.DataFrame({f"Casing shoe depth ({depth_unit})": pd.Series([], dtype=float)})
+        casing_edit = st.data_editor(
+            casing_default, num_rows="dynamic", hide_index=True, use_container_width=True, key="wbs_casing",
+        )
+        casing_depths = sorted(
+            float(v) for v in casing_edit.iloc[:, 0].tolist()
+            if pd.notna(v) and np.isfinite(v)
+        )
+
+        # Per-section safe MW range (breakout .. loss gradient) between casing shoes.
+        depth_num = pd.to_numeric(results["DEPTH"], errors="coerce")
+        edges = [float(depth_num.min())] + casing_depths + [float(depth_num.max())]
+        edges = sorted(set(round(e, 3) for e in edges))
+        section_rows = []
+        for a, b in zip(edges[:-1], edges[1:]):
+            m = (depth_num >= a) & (depth_num <= b)
+            if not m.any():
+                continue
+            sec_lo = float((results.loc[m, "MW_BREAKOUT_GCC"] * factor).max())  # highest breakout = min safe MW
+            sec_hi = float((results.loc[m, "MW_LOSS_GCC"] * factor).min())      # lowest loss = max safe MW
+            ok = "✅" if (np.isfinite(sec_lo) and np.isfinite(sec_hi) and sec_lo <= mw_value <= sec_hi) else "⚠️"
+            section_rows.append({
+                f"Top ({depth_unit})": round(a, 1),
+                f"Base ({depth_unit})": round(b, 1),
+                f"Min MW ({mw_unit})": round(sec_lo, 2),
+                f"Max MW ({mw_unit})": round(sec_hi, 2),
+                f"Planned MW ({mw_unit})": round(mw_value, 2),
+                "MW in window?": ok,
+            })
+        if section_rows:
+            st.markdown("**Safe MW range per section** (min = highest breakout, max = lowest loss gradient):")
+            st.dataframe(pd.DataFrame(section_rows), use_container_width=True, hide_index=True)
+
+        st.plotly_chart(
+            mud_window_figure(disp, DEPTH, N, mw_unit, litho_codes=litho_arg,
+                              mw_line=mw_value, ecd_line=ecd_value, casing_depths=casing_depths),
+            use_container_width=True,
+        )
 
 # --- Tab 7: QC & Results ----------------------------------------------------
 with tab_qc:
