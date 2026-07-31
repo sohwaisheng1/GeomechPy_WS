@@ -65,19 +65,67 @@ def style_flags(table: pd.DataFrame, flags: pd.DataFrame, columns: list[str]) ->
     return table[shown].style.apply(_color, axis=None).format(precision=3)
 
 
-def depth_track_figure(df: pd.DataFrame, depth_col: str, tracks: list[tuple[str, list[tuple[str, str]]]], height: int = 750) -> go.Figure:
+def _add_lithology_column(fig: go.Figure, depth_series, code_series, col: int) -> None:
+    """Draw the lithology flag as a colored track (contiguous runs shaded by code)
+    into subplot column `col`, plus one legend entry per lithology present."""
+    depth = pd.to_numeric(depth_series, errors="coerce").to_numpy(dtype=float)
+    codes = pd.to_numeric(code_series, errors="coerce").to_numpy(dtype=float)
+    filled = np.where(np.isfinite(codes), codes, -1.0)
+    n = len(filled)
+    present = []
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and filled[j + 1] == filled[i]:
+            j += 1
+        c = int(filled[i])
+        y0 = depth[i]
+        y1 = depth[j + 1] if (j + 1) < n else depth[j]
+        fig.add_shape(type="rect", x0=0.0, x1=1.0, y0=y0, y1=y1,
+                      fillcolor=mc.LITHO_COLORS.get(c, "#ecf0f1"), line_width=0, layer="below",
+                      row=1, col=col)
+        present.append(c)
+        i = j + 1
+    for c in sorted(set(present)):
+        label = mc.LITHO_NAME_BY_CODE.get(c, "Undefined")
+        name = f"{label} ({c})" if c >= 0 else "Undefined"
+        fig.add_trace(
+            go.Scatter(x=[None], y=[None], mode="markers",
+                       marker=dict(size=11, color=mc.LITHO_COLORS.get(c, "#ecf0f1")),
+                       name=name, legendgroup="lithology"),
+            row=1, col=col,
+        )
+    fig.update_xaxes(visible=False, range=[0.0, 1.0], row=1, col=col)
+
+
+def depth_track_figure(df: pd.DataFrame, depth_col: str, tracks: list[tuple[str, list[tuple[str, str]]]], height: int = 750, litho_codes=None) -> go.Figure:
     """Build a multi-track log plot (property vs depth, depth increasing downwards).
 
     tracks: list of (track_title, [(column, legend_name), ...])
+    litho_codes: optional series (aligned to df) — when given, a colored
+    lithology flag track is added as the first (leftmost) column.
     """
+    has_litho_track = litho_codes is not None
+    n_prop = len(tracks)
+    ncols = n_prop + (1 if has_litho_track else 0)
+    titles = (["Litho"] if has_litho_track else []) + [t[0] for t in tracks]
+    widths = None
+    if has_litho_track:
+        raw = [0.5] + [2.2] * n_prop  # narrow lithology strip, wider property tracks
+        total = sum(raw)
+        widths = [w / total for w in raw]
     fig = make_subplots(
         rows=1,
-        cols=len(tracks),
+        cols=ncols,
         shared_yaxes=True,
         horizontal_spacing=0.03,
-        subplot_titles=[t[0] for t in tracks],
+        subplot_titles=titles,
+        column_widths=widths,
     )
-    for i, (_, curves) in enumerate(tracks, start=1):
+    offset = 1 if has_litho_track else 0
+    if has_litho_track:
+        _add_lithology_column(fig, df[depth_col], litho_codes, col=1)
+    for i, (_, curves) in enumerate(tracks, start=1 + offset):
         for col, name in curves:
             if col not in df.columns:
                 continue
@@ -102,52 +150,52 @@ def depth_track_figure(df: pd.DataFrame, depth_col: str, tracks: list[tuple[str,
     return fig
 
 
-def mud_window_figure(disp: pd.DataFrame, depth_col: str, N: dict[str, str], unit: str, height: int = 720) -> go.Figure:
+def mud_window_figure(disp: pd.DataFrame, depth_col: str, N: dict[str, str], unit: str, height: int = 720, litho_codes=None) -> go.Figure:
     """NEW: mud weight window plot.
 
     Safe window (green) is shaded between the breakout limit (min MW, shear
     failure) and the LOSS GRADIENT (max MW = minimum principal stress among
     Sv/SHmax/Shmin) — exceeding the loss gradient risks losses into
     natural/reopened fractures. Breakdown (fracture initiation), Pp and Sv
-    are shown as reference lines.
+    are shown as reference lines. A lithology flag track is prepended when
+    litho_codes is provided.
     """
-    fig = go.Figure()
-    bo, loss = N.get("MW_BREAKOUT_GCC"), N.get("MW_LOSS_GCC")
-    if bo in disp.columns and loss in disp.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=disp[bo], y=disp[depth_col], mode="lines", name="Breakout limit (min MW)",
-                line=dict(color="#c82333"),
-                hovertemplate=f"Breakout: %{{x:.3f}} {unit}<br>Depth: %{{y:.1f}}<extra></extra>",
-            )
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=disp[loss], y=disp[depth_col], mode="lines",
-                name="Loss gradient / min σ (max MW)",
-                line=dict(color="#6f42c1"), fill="tonextx", fillcolor="rgba(40, 167, 69, 0.18)",
-                hovertemplate=f"Loss gradient: %{{x:.3f}} {unit}<br>Depth: %{{y:.1f}}<extra></extra>",
-            )
-        )
-    reference_curves = [
-        ("MW_BREAKDOWN_GCC", "Breakdown limit (fracture)", "dashdot", "#1f77b4"),
-        ("MW_PP_GCC", "Pore pressure EMW", "dot", "gray"),
-        ("MW_SV_GCC", "Overburden EMW", "dash", "gray"),
-    ]
-    for canonical, label, dash, color in reference_curves:
-        col = N.get(canonical)
-        if col in disp.columns:
+    has_litho_track = litho_codes is not None
+    if has_litho_track:
+        fig = make_subplots(rows=1, cols=2, shared_yaxes=True, horizontal_spacing=0.03,
+                            subplot_titles=["Litho", "Mud weight window"],
+                            column_widths=[0.12, 0.88])
+        _add_lithology_column(fig, disp[depth_col], litho_codes, col=1)
+        mw_col = 2
+    else:
+        fig = make_subplots(rows=1, cols=1, subplot_titles=["Mud weight window"])
+        mw_col = 1
+
+    def _line(canonical, label, color, dash=None, fill=None):
+        c = N.get(canonical)
+        if c in disp.columns:
             fig.add_trace(
                 go.Scatter(
-                    x=disp[col], y=disp[depth_col], mode="lines", name=label,
-                    line=dict(dash=dash, color=color),
+                    x=disp[c], y=disp[depth_col], mode="lines", name=label,
+                    line=dict(color=color, dash=dash), fill=fill,
+                    fillcolor="rgba(40, 167, 69, 0.18)" if fill else None,
                     hovertemplate=f"{label}: %{{x:.3f}} {unit}<br>Depth: %{{y:.1f}}<extra></extra>",
-                )
+                ),
+                row=1, col=mw_col,
             )
-    fig.update_yaxes(autorange="reversed", title_text=depth_col)
+
+    # safe window: breakout (lower) -> loss gradient (upper, filled green)
+    _line("MW_BREAKOUT_GCC", "Breakout limit (min MW)", "#c82333")
+    _line("MW_LOSS_GCC", "Loss gradient / min σ (max MW)", "#6f42c1", fill="tonextx")
+    # reference lines
+    _line("MW_BREAKDOWN_GCC", "Breakdown limit (fracture)", "#1f77b4", dash="dashdot")
+    _line("MW_PP_GCC", "Pore pressure EMW", "gray", dash="dot")
+    _line("MW_SV_GCC", "Overburden EMW", "gray", dash="dash")
+
+    fig.update_yaxes(autorange="reversed", title_text=depth_col, col=1)
+    fig.update_xaxes(title_text=f"Equivalent mud weight ({unit})", row=1, col=mw_col)
     fig.update_layout(
         height=height,
-        xaxis_title=f"Equivalent mud weight ({unit})",
         # title at the very top, legend BELOW the plot -> no overlap
         title=dict(text="Mud weight window (green = safe window: breakout → loss gradient)",
                    y=0.98, yanchor="top"),
@@ -519,6 +567,10 @@ def with_litho(cols: list[str]) -> list[str]:
     return cols
 
 
+# Lithology code series passed to every depth plot so the flag renders as a track.
+litho_arg = disp[N["LITHO_CODE"]] if (has_litho and disp is not None) else None
+
+
 def lithology_figure(depth_series, code_series, height: int = 650, title: str = "Lithology (from GR)") -> go.Figure:
     """Colored lithology strip vs depth (contiguous runs shaded by code)."""
     depth = pd.to_numeric(depth_series, errors="coerce").to_numpy(dtype=float)
@@ -551,17 +603,6 @@ def lithology_figure(depth_series, code_series, height: int = 650, title: str = 
                       legend=dict(orientation="h", yanchor="bottom", y=1.02),
                       margin=dict(t=70, b=40))
     return fig
-
-
-def litho_expander(key: str, label: str = "🪨 Lithology flag (from GR)") -> None:
-    """Show the lithology strip in a collapsed expander (for computation tabs)."""
-    if has_litho:
-        with st.expander(label, expanded=False):
-            st.plotly_chart(
-                lithology_figure(disp[DEPTH], disp[N["LITHO_CODE"]], height=430),
-                use_container_width=True,
-                key=f"litho_{key}",
-            )
 
 
 st.title("Quick MEM Calculator")
@@ -674,7 +715,7 @@ with tab_strat:
                 depth_track_figure(
                     disp, DEPTH,
                     [("GR (gAPI)", [(N["GR"], "GR")])],
-                    height=620,
+                    height=620, litho_codes=litho_arg,
                 ),
                 use_container_width=True,
             )
@@ -699,7 +740,6 @@ with tab_ovb:
             + f" · Sv gradient source: {sp.get('ovb_source', '-')}"
             + f" · Pp gradient {sp.get('pp_gradient_psift', 0):.3f} psi/ft. MD assumed ≈ TVD (vertical well)."
         )
-        litho_expander("ovb")
         ovb_cols = [DEPTH] + [N[c] for c in ["SV_MPA", "PP_MPA", "MW_SV_GCC", "MW_PP_GCC"]]
         st.dataframe(style_flags(disp, flags_disp, with_litho(ovb_cols)), use_container_width=True, height=380)
         mw_unit = mc.display_unit("MW_PP_GCC", unit_system)
@@ -710,7 +750,7 @@ with tab_ovb:
                     (f"Pressure ({mc.display_unit('SV_MPA', unit_system)})", [(N["SV_MPA"], "Sv"), (N["PP_MPA"], "Pp")]),
                     (f"Equivalent gradients ({mw_unit})", [(N["MW_SV_GCC"], "Sv EMW"), (N["MW_PP_GCC"], "Pp EMW")]),
                 ],
-                height=650,
+                height=650, litho_codes=litho_arg,
             ),
             use_container_width=True,
         )
@@ -726,7 +766,6 @@ with tab_rock:
             f"UCS: **{ucs_method_label}** ×{ucs_multiplier:.2f} · FANG: **{fang_method_label}** · "
             f"TSTR = {tstr_multiplier:.2f} × UCS."
         )
-        litho_expander("rock")
 
         st.markdown("**Dynamic elastic properties** (from DTCO / DTSM / RHOB)")
         dyn_cols = [DEPTH] + [N[c] for c in ["VP_MS", "VS_MS", "VPVS", "YME_DYN_GPA", "PR_DYN", "K_DYN_GPA", "G_DYN_GPA", "LAME_DYN_GPA", "M_DYN_GPA"]]
@@ -746,7 +785,7 @@ with tab_rock:
                     (f"UCS / TSTR ({mc.display_unit('UCS_MPA', unit_system)})", [(N["UCS_MPA"], "UCS"), (N["TSTR_MPA"], "TSTR")]),
                     ("Friction angle (°)", [(N["FANG_DEG"], "FANG")]),
                 ],
-                height=680,
+                height=680, litho_codes=litho_arg,
             ),
             use_container_width=True,
         )
@@ -767,7 +806,6 @@ with tab_hstress:
             + (f" · SHmax multiplier ×{sp.get('shmax_multiplier', 1.1):.2f}" if sp.get("shmax_method") == "multiplier" else "")
             + ". Shmin from the poroelastic equation (static PR & YME, Biot, tectonic strains)."
         )
-        litho_expander("hstress")
         hs_cols = [DEPTH] + [N[c] for c in ["SV_MPA", "PP_MPA", "SHMIN_MPA", "SHMAX_MPA", "Q_FACTOR", "SH_RATIO"]]
         st.dataframe(style_flags(disp, flags_disp, with_litho(hs_cols)), use_container_width=True, height=380)
 
@@ -788,7 +826,7 @@ with tab_hstress:
                     ("q-factor (-)", [(N["Q_FACTOR"], "q")]),
                     ("SHmax/Shmin (-)", [(N["SH_RATIO"], "ratio")]),
                 ],
-                height=650,
+                height=650, litho_codes=litho_arg,
             ),
             use_container_width=True,
         )
@@ -807,7 +845,6 @@ with tab_wbs:
             "The green band is the safe mud weight window (**breakout limit → loss gradient**). "
             "Breakdown (fracture initiation, Hubbert & Willis) is shown as a reference only."
         )
-        litho_expander("wbs")
 
         mw_unit = mc.display_unit("MW_BREAKOUT_GCC", unit_system)
         # Safe window: breakout (lower bound) up to the loss gradient (upper bound = min principal stress)
@@ -827,7 +864,7 @@ with tab_wbs:
 
         wbs_cols = [DEPTH] + [N[c] for c in ["PW_BREAKOUT_MPA", "PW_BREAKDOWN_MPA", "LOSS_P_MPA", "MW_BREAKOUT_GCC", "MW_BREAKDOWN_GCC", "MW_LOSS_GCC", "MW_PP_GCC", "MW_SV_GCC"]]
         st.dataframe(style_flags(disp, flags_disp, with_litho(wbs_cols)), use_container_width=True, height=380)
-        st.plotly_chart(mud_window_figure(disp, DEPTH, N, mw_unit), use_container_width=True)
+        st.plotly_chart(mud_window_figure(disp, DEPTH, N, mw_unit, litho_codes=litho_arg), use_container_width=True)
 
 # --- Tab 7: QC & Results ----------------------------------------------------
 with tab_qc:
@@ -889,14 +926,7 @@ with tab_qc:
                     [(N["MW_BREAKOUT_GCC"], "MW min"), (N["MW_BREAKDOWN_GCC"], "MW max"), (N["MW_PP_GCC"], "Pp EMW")],
                 ),
             ]
-        st.plotly_chart(depth_track_figure(disp, DEPTH, composite_tracks, height=800), use_container_width=True)
-
-        if has_litho:
-            st.plotly_chart(
-                lithology_figure(disp[DEPTH], disp[N["LITHO_CODE"]], height=500),
-                use_container_width=True,
-                key="litho_qc",
-            )
+        st.plotly_chart(depth_track_figure(disp, DEPTH, composite_tracks, height=800, litho_codes=litho_arg), use_container_width=True)
 
         with st.expander("Crossplot explorer"):
             numeric_cols = [c for c in disp.columns if pd.api.types.is_numeric_dtype(disp[c])]
