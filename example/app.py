@@ -11,6 +11,7 @@ unit systems for both input and display.
 Run locally:   streamlit run app.py
 """
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -301,6 +302,15 @@ with st.sidebar:
                                         help="GR at clean sand → FANG = 45°.")
         fang_gr_max = cgr2.number_input("GR max (pure shale, gAPI)", value=120.0, format="%.1f",
                                         help="GR at pure shale → FANG = 15°. Must differ from GR min.")
+    ucs_multiplier = st.slider(
+        "UCS calibration multiplier",
+        min_value=0.5,
+        max_value=2.0,
+        value=1.0,
+        step=0.05,
+        help="Scales the UCS output (and TSTR derived from it) — calibrate against core test data, "
+        "just like the static YME multiplier.",
+    )
     tstr_multiplier = st.slider(
         "Tensile strength / UCS ratio",
         min_value=0.05,
@@ -311,7 +321,38 @@ with st.sidebar:
     )
 
     st.divider()
-    st.header("6. Stress & wellbore stability")
+    st.header("6. Mechanical stratigraphy")
+    # NEW: GR-based lithology flag with user-defined cutoffs
+    compute_litho = st.checkbox(
+        "Flag lithology from GR",
+        value=True,
+        help="Classify each sample into sandstone (0), shale (1), limestone (2) or coal (6) "
+        "using GR windows. The flag is shown on the stratigraphy tab and alongside the "
+        "computation tabs.",
+    )
+    litho_config = None
+    if compute_litho:
+        st.caption(
+            "Define the GR window [min, max) gAPI for each lithology. First matching row wins "
+            "(priority = top to bottom). Samples matching none are 'Undefined'."
+        )
+        litho_editor = st.data_editor(
+            pd.DataFrame(mc.default_litho_config()),
+            column_config={
+                "name": st.column_config.TextColumn("Lithology", disabled=True),
+                "code": st.column_config.NumberColumn("Code", disabled=True),
+                "gr_min": st.column_config.NumberColumn("GR min", min_value=0.0, step=1.0, format="%.1f"),
+                "gr_max": st.column_config.NumberColumn("GR max", min_value=0.0, step=1.0, format="%.1f"),
+            },
+            hide_index=True,
+            num_rows="fixed",
+            use_container_width=True,
+            key="litho_editor",
+        )
+        litho_config = litho_editor.to_dict("records")
+
+    st.divider()
+    st.header("7. Stress & wellbore stability")
     # NEW: overburden / pore pressure / horizontal stress / stability inputs
     compute_stress = st.checkbox(
         "Compute stresses & mud weight window",
@@ -396,6 +437,8 @@ workflow_settings = dict(
     fang_constant_deg=fang_constant_deg,
     fang_gr_min=fang_gr_min,
     fang_gr_max=fang_gr_max,
+    ucs_multiplier=ucs_multiplier,
+    litho_config=litho_config,
     stress_params=stress_params,
 )
 
@@ -440,156 +483,196 @@ flags = st.session_state.qc_flags
 
 # Convert canonical results into the selected display unit system.
 # N maps canonical column names -> display names (e.g. YME_DYN_GPA -> 'YME_DYN [Mpsi]').
+# has_stress requires the FULL current stress column set (incl. the loss gradient)
+# so results from an older run/app version prompt a re-run instead of KeyError.
+STRESS_COLUMNS = ["SV_MPA", "PP_MPA", "SHMIN_MPA", "SHMAX_MPA", "LOSS_P_MPA",
+                  "MW_BREAKOUT_GCC", "MW_BREAKDOWN_GCC", "MW_LOSS_GCC"]
+STRESS_INFO = (
+    "Enable **Compute stresses & mud weight window** in the sidebar and click "
+    "**🚀 Run MEM Calculation** — the results currently in memory don't include "
+    "the full stress profile (they may be from an older run or app version)."
+)
 if results is not None:
     disp, N = mc.display_results(results, unit_system)
     flags_disp = flags.rename(columns=N) if flags is not None else None
     DEPTH = N["DEPTH"]
-    has_stress = "SV_MPA" in results.columns
+    has_stress = all(c in results.columns for c in STRESS_COLUMNS)
+    has_litho = "LITHO_CODE" in results.columns and results["LITHO_CODE"].notna().any()
 else:
-    disp, N, flags_disp, DEPTH, has_stress = None, {}, None, None, False
+    disp, N, flags_disp, DEPTH, has_stress, has_litho = None, {}, None, None, False, False
+
+
+def lithology_figure(depth_series, code_series, height: int = 650, title: str = "Lithology (from GR)") -> go.Figure:
+    """Colored lithology strip vs depth (contiguous runs shaded by code)."""
+    depth = pd.to_numeric(depth_series, errors="coerce").to_numpy(dtype=float)
+    codes = pd.to_numeric(code_series, errors="coerce").to_numpy(dtype=float)
+    filled = np.where(np.isfinite(codes), codes, -1.0)
+    n = len(filled)
+    fig = go.Figure()
+    present = []
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and filled[j + 1] == filled[i]:
+            j += 1
+        code = int(filled[i])
+        y0 = depth[i]
+        y1 = depth[j + 1] if (j + 1) < n else depth[j]
+        fig.add_shape(type="rect", xref="x", yref="y", x0=0.0, x1=1.0, y0=y0, y1=y1,
+                      fillcolor=mc.LITHO_COLORS.get(code, "#ecf0f1"), line_width=0, layer="below")
+        present.append(code)
+        i = j + 1
+    for code in sorted(set(present)):
+        label = mc.LITHO_NAME_BY_CODE.get(code, "Undefined")
+        name = f"{label} ({code})" if code >= 0 else "Undefined"
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers",
+                                 marker=dict(size=12, color=mc.LITHO_COLORS.get(code, "#ecf0f1")),
+                                 name=name))
+    fig.update_xaxes(visible=False, range=[0.0, 1.0])
+    fig.update_yaxes(autorange="reversed", title_text=DEPTH if DEPTH else "Depth")
+    fig.update_layout(height=height, title=title,
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                      margin=dict(t=70, b=40))
+    return fig
+
+
+def litho_expander(key: str, label: str = "🪨 Lithology flag (from GR)") -> None:
+    """Show the lithology strip in a collapsed expander (for computation tabs)."""
+    if has_litho:
+        with st.expander(label, expanded=False):
+            st.plotly_chart(
+                lithology_figure(disp[DEPTH], disp[N["LITHO_CODE"]], height=430),
+                use_container_width=True,
+                key=f"litho_{key}",
+            )
+
+
+st.title("Quick MEM Calculator")
+st.markdown(
+    "Build a quick-look **Mechanical Earth Model** from standard well logs: "
+    "mechanical stratigraphy → stresses → rock properties → wellbore stability, with built-in QC."
+)
+
+for warning in st.session_state.unit_warnings:
+    st.warning(f"⚠️ Unit check: {warning}")
 
 (
     tab_input,
-    tab_dyn,
-    tab_sta,
-    tab_strength,
+    tab_strat,
     tab_ovb,
+    tab_rock,
     tab_hstress,
     tab_wbs,
-    tab_barrier,
-    tab_tornado,
     tab_qc,
+    tab_tornado,
 ) = st.tabs(
     [
         "📥 Data Input",
-        "🌊 Dynamic Props",
-        "🧱 Static Props",
-        "💪 Rock Strength",
+        "🪨 Mechanical Stratigraphy",
         "🏔️ Overburden & Pore Pressure",
+        "🧱 Rock Properties",
         "↔️ Horizontal Stress",
         "🛢️ Wellbore Stability",
-        "🚧 Stress Barrier & Perforation Zones",
-        "🌪️ Sensitivity (Tornado)",
         "✅ QC & Results",
+        "🌪️ Sensitivity (Tornado)",
     ]
 )
 
 # --- Tab 1: Data input ------------------------------------------------------
 with tab_input:
+    st.subheader("Data input")
+    # Clear expected-columns reference as a table, in the selected unit system.
+    curve_meta = [
+        ("DEPTH", "MD", "Measured depth (assumed ≈ TVD, vertical well)", "Required", "2500.0"),
+        ("GR", "Gamma ray", "Shale/lithology indicator; drives mechanical stratigraphy", "Required", "75.0"),
+        ("RHOB", "Bulk density", "Formation bulk density (elastic properties, Sv option)", "Required", "2.45"),
+        ("DTCO", "Compressional slowness", "P-sonic transit time (Vp, moduli, McNally UCS, Lal FANG)", "Required", "85.0"),
+        ("DTSM", "Shear slowness", "S-sonic transit time (Vs, moduli)", "Required", "150.0"),
+        ("POROSITY", "Porosity", "Total/effective porosity (only for the Morales static method)", "Optional", "0.18"),
+    ]
+    ref = pd.DataFrame(
+        [
+            {
+                "Curve": c,
+                "Description": f"{name} — {desc}",
+                f"Unit ({unit_system})": expected[c],
+                "Requirement": req,
+                "Example value": ex,
+            }
+            for c, name, desc, req, ex in curve_meta
+        ]
+    )
+    st.markdown(
+        f"**Expected input columns** — one row per depth sample. Column *names* can be anything; "
+        f"map them to these curves in the sidebar. Units below follow the selected **{unit_system}** system."
+    )
+    st.dataframe(ref, use_container_width=True, hide_index=True)
+    st.caption(
+        "Tip: use **⬇️ Download Example File** in the sidebar for a correctly formatted CSV template, "
+        "or **🧪 Load Sample Data** to try the app immediately. Unit rows under the header and "
+        "-999.25 / -9999 null flags are handled automatically on upload."
+    )
+
     if st.session_state.raw_df is None:
         st.info("👈 Upload a CSV/Excel file or click **Load Sample Data** in the sidebar to get started.")
-        unit_rows = "\n".join(
-            f"| {curve} | {desc} | {expected[curve]} |"
-            for curve, desc in [
-                ("DEPTH", "Measured depth (MD)"),
-                ("GR", "Gamma ray"),
-                ("RHOB", "Bulk density"),
-                ("DTCO", "Compressional slowness"),
-                ("DTSM", "Shear slowness"),
-                ("POROSITY", "Total/effective porosity (optional)"),
-            ]
-        )
-        st.markdown(
-            f"""
-            **Expected input columns for {unit_system}** (any names — map them in the sidebar):
-
-            | Curve | Description | Unit |
-            |---|---|---|
-            {unit_rows}
-
-            Use **Download Example File** in the sidebar to get a correctly formatted template.
-            """
-        )
     else:
         df_in = st.session_state.raw_df
+        st.divider()
         c1, c2, c3 = st.columns(3)
         c1.metric("Rows", f"{len(df_in):,}")
         c2.metric("Columns", df_in.shape[1])
         depth_col = column_map.get("DEPTH") if column_map else None
         if depth_col:
             c3.metric("Depth range", f"{df_in[depth_col].min():.0f} – {df_in[depth_col].max():.0f} {depth_unit}")
-        st.subheader("Input data preview")
-        st.dataframe(df_in, use_container_width=True, height=420)
+        st.subheader("Uploaded data preview")
+        st.dataframe(df_in, use_container_width=True, height=380)
         with st.expander("Basic statistics"):
             st.dataframe(df_in.describe().T, use_container_width=True)
 
-# --- Tab 2: Dynamic properties ----------------------------------------------
-with tab_dyn:
+# --- Tab 2: Mechanical Stratigraphy -----------------------------------------
+with tab_strat:
+    st.subheader("Mechanical Stratigraphy")
+    st.markdown(
+        "Each depth is flagged into a lithology from **GR** using the cutoff windows defined in the "
+        "sidebar (**6. Mechanical stratigraphy**): sandstone (code 0), shale (1), limestone (2), coal (6). "
+        "The flag is carried through and shown alongside the computation tabs."
+    )
     if results is None:
-        st.info("Run the calculation from the sidebar to see dynamic elastic properties.")
+        st.info("Run the calculation from the sidebar to generate the lithology flag.")
+    elif not has_litho:
+        st.info("Enable **Flag lithology from GR** in the sidebar (section 6) and re-run.")
     else:
-        st.subheader(f"Dynamic elastic properties ({unit_system})")
-        st.caption("Slowness converted to velocity (v = 304800/Δt[µs/ft]), moduli computed by geomechpy.")
-        dyn_cols = [DEPTH] + [N[c] for c in ["VP_MS", "VS_MS", "VPVS", "YME_DYN_GPA", "PR_DYN", "K_DYN_GPA", "G_DYN_GPA", "LAME_DYN_GPA", "M_DYN_GPA"]]
-        st.dataframe(style_flags(disp, flags_disp, dyn_cols), use_container_width=True, height=420)
+        counts = mc.lithology_counts(results)
+        cols = st.columns(len(mc.LITHO_NAME_BY_CODE))
+        for col, (code, name) in zip(cols, mc.LITHO_NAME_BY_CODE.items()):
+            row = counts[counts["Code"] == code]
+            pct = float(row["Fraction %"].iloc[0]) if not row.empty else 0.0
+            col.metric(f"{name} ({code})", f"{pct:.1f}%")
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            st.markdown("**Lithology fractions**")
+            st.dataframe(counts, use_container_width=True, hide_index=True)
+        with c2:
+            st.plotly_chart(
+                depth_track_figure(
+                    disp, DEPTH,
+                    [("GR (gAPI)", [(N["GR"], "GR")])],
+                    height=620,
+                ),
+                use_container_width=True,
+            )
         st.plotly_chart(
-            depth_track_figure(
-                disp,
-                DEPTH,
-                [
-                    (f"Velocities ({mc.display_unit('VP_MS', unit_system)})", [(N["VP_MS"], "Vp"), (N["VS_MS"], "Vs")]),
-                    (f"Young's mod. ({mc.display_unit('YME_DYN_GPA', unit_system)})", [(N["YME_DYN_GPA"], "E dyn")]),
-                    ("Poisson's ratio", [(N["PR_DYN"], "ν dyn")]),
-                    (f"Bulk / Shear ({mc.display_unit('K_DYN_GPA', unit_system)})", [(N["K_DYN_GPA"], "K dyn"), (N["G_DYN_GPA"], "G dyn")]),
-                ],
-                height=650,
-            ),
+            lithology_figure(disp[DEPTH], disp[N["LITHO_CODE"]], height=620),
             use_container_width=True,
+            key="litho_strat",
         )
 
-# --- Tab 3: Static properties -----------------------------------------------
-with tab_sta:
-    if results is None:
-        st.info("Run the calculation from the sidebar to see static elastic properties.")
-    else:
-        st.subheader(f"Static elastic properties ({unit_system})")
-        st.caption(f"Method: **{method_label}** · calibration multiplier ×{calibration_multiplier:.2f} · PR multiplier ×{pr_multiplier:.2f}")
-        sta_cols = [DEPTH] + [N[c] for c in ["YME_DYN_GPA", "YME_STA_GPA", "PR_DYN", "PR_STA"]]
-        st.dataframe(style_flags(disp, flags_disp, sta_cols), use_container_width=True, height=420)
-
-        fig = depth_track_figure(
-            disp,
-            DEPTH,
-            [
-                (f"Young's modulus ({mc.display_unit('YME_STA_GPA', unit_system)})", [(N["YME_DYN_GPA"], "E dynamic"), (N["YME_STA_GPA"], "E static")]),
-                ("Poisson's ratio", [(N["PR_DYN"], "ν dynamic"), (N["PR_STA"], "ν static")]),
-            ],
-            height=650,
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-# --- Tab 4: Rock strength (with method selection) -----------------------------
-with tab_strength:
-    if results is None:
-        st.info("Run the calculation from the sidebar to see rock strength results.")
-    else:
-        st.subheader(f"Rock strength ({unit_system})")
-        st.caption(
-            f"UCS: **{ucs_method_label}** · FANG: **{fang_method_label}** · "
-            f"TSTR = {tstr_multiplier:.2f} × UCS."
-        )
-        str_cols = [DEPTH] + [N[c] for c in ["UCS_MPA", "TSTR_MPA", "FANG_DEG"]]
-        st.dataframe(style_flags(disp, flags_disp, str_cols), use_container_width=True, height=420)
-        st.plotly_chart(
-            depth_track_figure(
-                disp,
-                DEPTH,
-                [
-                    (f"UCS ({mc.display_unit('UCS_MPA', unit_system)})", [(N["UCS_MPA"], "UCS")]),
-                    (f"Tensile strength ({mc.display_unit('TSTR_MPA', unit_system)})", [(N["TSTR_MPA"], "TSTR")]),
-                    ("Friction angle (°)", [(N["FANG_DEG"], "FANG")]),
-                ],
-                height=650,
-            ),
-            use_container_width=True,
-        )
-
-# --- Tab 5: NEW — Overburden & Pore Pressure ----------------------------------
+# --- Tab 3: Overburden & Pore Pressure --------------------------------------
 with tab_ovb:
     if results is None:
         st.info("Run the calculation from the sidebar to see the overburden and pore pressure profiles.")
     elif not has_stress:
-        st.info("Enable **Compute stresses & mud weight window** in the sidebar and re-run.")
+        st.info(STRESS_INFO)
     else:
         st.subheader(f"Overburden stress & pore pressure ({unit_system})")
         sp = stress_params or {}
@@ -599,13 +682,13 @@ with tab_ovb:
             + f" · Sv gradient source: {sp.get('ovb_source', '-')}"
             + f" · Pp gradient {sp.get('pp_gradient_psift', 0):.3f} psi/ft. MD assumed ≈ TVD (vertical well)."
         )
+        litho_expander("ovb")
         ovb_cols = [DEPTH] + [N[c] for c in ["SV_MPA", "PP_MPA", "MW_SV_GCC", "MW_PP_GCC"]]
         st.dataframe(style_flags(disp, flags_disp, ovb_cols), use_container_width=True, height=380)
         mw_unit = mc.display_unit("MW_PP_GCC", unit_system)
         st.plotly_chart(
             depth_track_figure(
-                disp,
-                DEPTH,
+                disp, DEPTH,
                 [
                     (f"Pressure ({mc.display_unit('SV_MPA', unit_system)})", [(N["SV_MPA"], "Sv"), (N["PP_MPA"], "Pp")]),
                     (f"Equivalent gradients ({mw_unit})", [(N["MW_SV_GCC"], "Sv EMW"), (N["MW_PP_GCC"], "Pp EMW")]),
@@ -615,12 +698,48 @@ with tab_ovb:
             use_container_width=True,
         )
 
-# --- Tab 6: NEW — Horizontal Stress -------------------------------------------
+# --- Tab 4: Rock Properties (dynamic + static + strength) -------------------
+with tab_rock:
+    if results is None:
+        st.info("Run the calculation from the sidebar to see rock properties.")
+    else:
+        st.subheader(f"Rock properties ({unit_system})")
+        st.caption(
+            f"Static YME: **{method_label}** ×{calibration_multiplier:.2f} · PR ×{pr_multiplier:.2f} · "
+            f"UCS: **{ucs_method_label}** ×{ucs_multiplier:.2f} · FANG: **{fang_method_label}** · "
+            f"TSTR = {tstr_multiplier:.2f} × UCS."
+        )
+        litho_expander("rock")
+
+        st.markdown("**Dynamic elastic properties** (from DTCO / DTSM / RHOB)")
+        dyn_cols = [DEPTH] + [N[c] for c in ["VP_MS", "VS_MS", "VPVS", "YME_DYN_GPA", "PR_DYN", "K_DYN_GPA", "G_DYN_GPA", "LAME_DYN_GPA", "M_DYN_GPA"]]
+        st.dataframe(style_flags(disp, flags_disp, dyn_cols), use_container_width=True, height=300)
+
+        st.markdown("**Static elastic + rock strength**")
+        sta_cols = [DEPTH] + [N[c] for c in ["YME_DYN_GPA", "YME_STA_GPA", "PR_DYN", "PR_STA", "UCS_MPA", "TSTR_MPA", "FANG_DEG"]]
+        st.dataframe(style_flags(disp, flags_disp, sta_cols), use_container_width=True, height=300)
+
+        st.plotly_chart(
+            depth_track_figure(
+                disp, DEPTH,
+                [
+                    (f"Velocities ({mc.display_unit('VP_MS', unit_system)})", [(N["VP_MS"], "Vp"), (N["VS_MS"], "Vs")]),
+                    (f"Young's mod. ({mc.display_unit('YME_DYN_GPA', unit_system)})", [(N["YME_DYN_GPA"], "E dyn"), (N["YME_STA_GPA"], "E sta")]),
+                    ("Poisson's ratio", [(N["PR_DYN"], "ν dyn"), (N["PR_STA"], "ν sta")]),
+                    (f"UCS / TSTR ({mc.display_unit('UCS_MPA', unit_system)})", [(N["UCS_MPA"], "UCS"), (N["TSTR_MPA"], "TSTR")]),
+                    ("Friction angle (°)", [(N["FANG_DEG"], "FANG")]),
+                ],
+                height=680,
+            ),
+            use_container_width=True,
+        )
+
+# --- Tab 5: Horizontal Stress -----------------------------------------------
 with tab_hstress:
     if results is None:
         st.info("Run the calculation from the sidebar to see horizontal stresses.")
     elif not has_stress:
-        st.info("Enable **Compute stresses & mud weight window** in the sidebar and re-run.")
+        st.info(STRESS_INFO)
     else:
         st.subheader(f"Horizontal stresses ({unit_system})")
         sp = stress_params or {}
@@ -631,6 +750,7 @@ with tab_hstress:
             + (f" · SHmax multiplier ×{sp.get('shmax_multiplier', 1.1):.2f}" if sp.get("shmax_method") == "multiplier" else "")
             + ". Shmin from the poroelastic equation (static PR & YME, Biot, tectonic strains)."
         )
+        litho_expander("hstress")
         hs_cols = [DEPTH] + [N[c] for c in ["SV_MPA", "PP_MPA", "SHMIN_MPA", "SHMAX_MPA", "Q_FACTOR", "SH_RATIO"]]
         st.dataframe(style_flags(disp, flags_disp, hs_cols), use_container_width=True, height=380)
 
@@ -642,8 +762,7 @@ with tab_hstress:
 
         st.plotly_chart(
             depth_track_figure(
-                disp,
-                DEPTH,
+                disp, DEPTH,
                 [
                     (
                         f"Stresses ({mc.display_unit('SV_MPA', unit_system)})",
@@ -657,20 +776,21 @@ with tab_hstress:
             use_container_width=True,
         )
 
-# --- Tab 7: NEW — Wellbore Stability ------------------------------------------
+# --- Tab 6: Wellbore Stability ----------------------------------------------
 with tab_wbs:
     if results is None:
         st.info("Run the calculation from the sidebar to see the wellbore stability results.")
     elif not has_stress:
-        st.info("Enable **Compute stresses & mud weight window** in the sidebar and re-run.")
+        st.info(STRESS_INFO)
     else:
         st.subheader(f"Wellbore stability — vertical well ({unit_system})")
         st.caption(
             "Breakout limit: Mohr-Coulomb shear failure (Kirsch, analytical) — drilling below it risks breakouts. "
             "Breakdown limit: fracture initiation (Hubbert & Willis) — drilling above it risks losses. "
-            "Loss gradient: minimum principal stress among Sv, SHmax and Shmin — exceeding it risks mud losses "
-            "into natural/reopened fractures. The green band is the safe mud weight window."
+            "Loss gradient: minimum principal stress among Sv, SHmax and Shmin. "
+            "The green band is the safe mud weight window."
         )
+        litho_expander("wbs")
 
         mw_unit = mc.display_unit("MW_BREAKOUT_GCC", unit_system)
         window = results["MW_BREAKDOWN_GCC"] - results["MW_BREAKOUT_GCC"]
@@ -690,265 +810,8 @@ with tab_wbs:
         wbs_cols = [DEPTH] + [N[c] for c in ["PW_BREAKOUT_MPA", "PW_BREAKDOWN_MPA", "LOSS_P_MPA", "MW_BREAKOUT_GCC", "MW_BREAKDOWN_GCC", "MW_LOSS_GCC", "MW_PP_GCC", "MW_SV_GCC"]]
         st.dataframe(style_flags(disp, flags_disp, wbs_cols), use_container_width=True, height=380)
         st.plotly_chart(mud_window_figure(disp, DEPTH, N, mw_unit), use_container_width=True)
-        st.plotly_chart(
-            depth_track_figure(
-                disp,
-                DEPTH,
-                [
-                    (
-                        f"Limit pressures ({mc.display_unit('PW_BREAKOUT_MPA', unit_system)})",
-                        [(N["PW_BREAKOUT_MPA"], "Breakout Pw"), (N["PW_BREAKDOWN_MPA"], "Breakdown Pw"), (N["PP_MPA"], "Pp")],
-                    ),
-                ],
-                height=550,
-            ),
-            use_container_width=True,
-        )
 
-# --- Tab 8: NEW — Stress Barrier & Perforation Zones ---------------------------
-with tab_barrier:
-    st.subheader("Stress Barrier Analysis & Perforation Zone Screening")
-    st.markdown(
-        """
-        Hydraulic fractures initiate where **Shmin is locally low** and stay contained when
-        intervals of **locally high Shmin (stress barriers)** exist above and below.
-        This analysis removes the depth trend from the computed Shmin profile and rates each
-        depth on the residual **stress contrast**:
-
-        - 🟥 **Barrier** — contrast above +threshold (frac containment interval)
-        - 🟩 **Good perforation zone** — low-stress target with barriers both above *and* below
-        - 🟨 **Moderate** — low-stress target with a barrier on one side only
-        - **Poor** — barriers themselves, neutral rock, or uncontained targets
-        """
-    )
-    if results is None:
-        st.info("Run the calculation from the sidebar first.")
-    elif not has_stress:
-        st.info("Enable **Compute stresses & mud weight window** in the sidebar and re-run.")
-    else:
-        p_unit = mc.display_unit("SHMIN_MPA", unit_system)
-        p_factor = mc.MPA_TO_PSI if unit_system == mc.OILFIELD else 1.0
-        c1, c2, c3 = st.columns(3)
-        if unit_system == mc.OILFIELD:
-            thr_disp = c1.slider(f"Stress contrast threshold ({p_unit})", 25, 500, 145, 5)
-            threshold_mpa = thr_disp / mc.MPA_TO_PSI
-        else:
-            thr_disp = c1.slider(f"Stress contrast threshold ({p_unit})", 0.2, 3.0, 1.0, 0.1)
-            threshold_mpa = thr_disp
-        search_window = c2.slider("Barrier search window (samples)", 5, 60, 20, 5,
-                                  help="How far above/below to look for a containing barrier.")
-        min_zone = c3.slider("Min. zone thickness (samples)", 2, 10, 3, 1)
-
-        try:
-            barrier = mc.analyze_stress_barriers(
-                results,
-                contrast_threshold_mpa=threshold_mpa,
-                search_window=search_window,
-                min_zone_samples=min_zone,
-            )
-        except ValueError as exc:
-            st.error(f"⚠️ {exc}")
-            barrier = None
-
-        if barrier is not None:
-            detail, zones, barriers = barrier["detail"], barrier["zones"], barrier["barriers"]
-            quality = detail["PERF_QUALITY"]
-            m1, m2, m3 = st.columns(3)
-            m1.metric("🟩 Good perforation zones", int((zones["Quality"] == "Good").sum()))
-            m2.metric("🟨 Moderate zones", int((zones["Quality"] == "Moderate").sum()))
-            m3.metric("🟥 Stress barriers", len(barriers))
-
-            # Stress profile with shaded barrier / perforation intervals
-            fig = go.Figure()
-            for canonical, name, color in [
-                ("SV_MPA", "Sv", "#6c757d"),
-                ("SHMAX_MPA", "SHmax", "#1f77b4"),
-                ("SHMIN_MPA", "Shmin", "#d95f02"),
-                ("PP_MPA", "Pp", "#2ca02c"),
-            ]:
-                fig.add_trace(
-                    go.Scatter(
-                        x=disp[N[canonical]], y=disp[DEPTH], mode="lines", name=name,
-                        line=dict(color=color),
-                        hovertemplate=f"{name}: %{{x:.2f}} {p_unit}<br>Depth: %{{y:.1f}}<extra></extra>",
-                    )
-                )
-            fig.add_trace(
-                go.Scatter(
-                    x=detail["TREND_MPA"] * p_factor, y=detail["DEPTH"], mode="lines",
-                    name="Shmin trend", line=dict(color="#d95f02", dash="dot", width=1),
-                    hovertemplate=f"Shmin trend: %{{x:.2f}} {p_unit}<br>Depth: %{{y:.1f}}<extra></extra>",
-                )
-            )
-            for _, z in barriers.iterrows():
-                fig.add_hrect(y0=z["Top"], y1=z["Base"], fillcolor="rgba(200, 35, 51, 0.15)", line_width=0)
-            for _, z in zones.iterrows():
-                color = "rgba(30, 126, 52, 0.22)" if z["Quality"] == "Good" else "rgba(211, 158, 0, 0.20)"
-                fig.add_hrect(y0=z["Top"], y1=z["Base"], fillcolor=color, line_width=0)
-            fig.update_yaxes(autorange="reversed", title_text=DEPTH)
-            fig.update_layout(
-                height=700,
-                xaxis_title=f"Stress ({p_unit})",
-                title="Stress profile — red bands = barriers, green = good zones, yellow = moderate",
-                legend=dict(orientation="h", yanchor="bottom", y=1.04),
-                margin=dict(t=90, b=40),
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            st.markdown("**Recommended perforation intervals**")
-            if zones.empty:
-                st.info(
-                    "No qualifying intervals found — try lowering the contrast threshold or the "
-                    "minimum zone thickness, or widen the barrier search window."
-                )
-            else:
-                zdisp = zones.copy()
-                zdisp["Mean Shmin (MPa)"] = zdisp["Mean Shmin (MPa)"] * p_factor
-                zdisp["Mean contrast (MPa)"] = zdisp["Mean contrast (MPa)"] * p_factor
-                zdisp = zdisp.rename(
-                    columns={
-                        "Top": f"Top ({depth_unit})",
-                        "Base": f"Base ({depth_unit})",
-                        "Thickness": f"Thickness ({depth_unit})",
-                        "Mean Shmin (MPa)": f"Mean Shmin ({p_unit})",
-                        "Mean contrast (MPa)": f"Mean contrast ({p_unit})",
-                    }
-                )
-                quality_css = {
-                    "Good": "background-color: #1e7e34; color: white",
-                    "Moderate": "background-color: #d39e00; color: black",
-                    "Poor": "background-color: #c82333; color: white",
-                }
-                st.dataframe(
-                    zdisp.style.map(lambda v: quality_css.get(v, ""), subset=["Quality"]).format(precision=2),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            with st.expander("Per-depth classification detail"):
-                ddisp = detail.copy()
-                for col in ("SHMIN_MPA", "TREND_MPA", "CONTRAST_MPA"):
-                    ddisp[col] = ddisp[col] * p_factor
-                ddisp = ddisp.rename(
-                    columns={
-                        "DEPTH": DEPTH,
-                        "SHMIN_MPA": f"SHMIN ({p_unit})",
-                        "TREND_MPA": f"Trend ({p_unit})",
-                        "CONTRAST_MPA": f"Contrast ({p_unit})",
-                    }
-                )
-                class_css = {
-                    "Barrier": "background-color: #c82333; color: white",
-                    "Target": "background-color: #1e7e34; color: white",
-                    "Neutral": "",
-                    "Good": "background-color: #1e7e34; color: white",
-                    "Moderate": "background-color: #d39e00; color: black",
-                    "Poor": "background-color: #6c757d; color: white",
-                }
-                st.dataframe(
-                    ddisp.style.map(lambda v: class_css.get(v, ""), subset=["CLASS", "PERF_QUALITY"]).format(precision=2),
-                    use_container_width=True,
-                    height=400,
-                )
-            st.caption(
-                "Screening heuristic based on relative Shmin contrast only — validate candidate zones "
-                "against reservoir quality, saturation and completion constraints before perforating."
-            )
-
-# --- Tab 9: Sensitivity analysis (Tornado plot) --------------------------------
-with tab_tornado:
-    st.subheader("Sensitivity Analysis (Tornado Plot)")
-    st.markdown(
-        """
-        The tornado plot shows **which input has the biggest impact on a chosen output**.
-        Using the currently loaded data as the *base case*, each input parameter
-        (GR, RHOB, DTCO, DTSM, POROSITY and the static YME calibration multiplier)
-        is varied **one at a time** by the selected percentage while everything else is
-        held fixed, and the full MEM workflow is recomputed. Bars show how the
-        **depth-averaged** target value moves relative to the base case — the longer the
-        bar, the more sensitive the result is to that input.
-
-        Notes: GR is carried through the workflow but does not enter any calculation
-        (QC only), so its bar is expectedly zero. POROSITY only affects results when the
-        Morales static correlation is selected. Stress and mud-weight targets are available
-        when stress computation is enabled. The analysis uses the current sidebar settings.
-        """
-    )
-    if st.session_state.raw_df is None:
-        st.info("👈 Load data in the sidebar first — the tornado plot needs a base case.")
-    else:
-        c1, c2 = st.columns(2)
-        tornado_targets = list(mc.TORNADO_TARGETS)
-        if stress_params is not None:
-            tornado_targets += mc.TORNADO_STRESS_TARGETS
-        target_options = [mc.display_name(t, unit_system) for t in tornado_targets]
-        target_label_sel = c1.selectbox(
-            "Target Output",
-            target_options,
-            index=0,
-            key="tornado_target",
-            help="Result whose sensitivity is analysed (depth-averaged mean).",
-        )
-        target_canonical = tornado_targets[target_options.index(target_label_sel)]
-        variation_pct = c2.select_slider(
-            "Variation Range",
-            options=[5, 10, 20],
-            value=10,
-            format_func=lambda v: f"±{v}%",
-            key="tornado_pct",
-        )
-
-        if st.button("🌪️ Generate Tornado Plot", type="primary", key="tornado_btn"):
-            try:
-                with st.spinner("Recomputing the workflow for each input variation..."):
-                    fig, table, base_disp, skipped = mc.generate_tornado_plot(
-                        st.session_state.raw_df,
-                        column_map,
-                        target_canonical,
-                        variation_pct,
-                        **workflow_settings,
-                    )
-                st.session_state.tornado = {
-                    "fig": fig,
-                    "table": table,
-                    "base": base_disp,
-                    "skipped": skipped,
-                    "target_label": mc.display_name(target_canonical, unit_system),
-                    "pct": variation_pct,
-                    "units": unit_system,
-                    "method": method_label,
-                }
-            except ValueError as exc:
-                st.session_state.tornado = None
-                st.error(f"⚠️ {exc}")
-            except Exception as exc:  # keep the app alive on unexpected input
-                st.session_state.tornado = None
-                st.error(f"Unexpected error during sensitivity analysis: {exc}")
-
-        tornado = st.session_state.tornado
-        if tornado is not None:
-            st.metric(
-                f"Base case — depth-averaged {tornado['target_label']}",
-                f"{tornado['base']:.3f}",
-            )
-            st.plotly_chart(tornado["fig"], use_container_width=True)
-            st.markdown("**Per-parameter results** (sorted by impact):")
-            st.dataframe(
-                tornado["table"].style.format(precision=3),
-                use_container_width=True,
-                hide_index=True,
-            )
-            if tornado["skipped"]:
-                st.info(
-                    "Skipped (not mapped or could not be recomputed): "
-                    + ", ".join(tornado["skipped"])
-                )
-            st.caption(
-                f"Generated with ±{tornado['pct']}% variation · {tornado['units']} · "
-                f"static method: {tornado['method']}. Re-generate after changing data or settings."
-            )
-
-# --- Tab 10: QC & Results -----------------------------------------------------
+# --- Tab 7: QC & Results ----------------------------------------------------
 with tab_qc:
     if results is None or st.session_state.qc_summary is None:
         st.info("Run the calculation from the sidebar to generate the QC report.")
@@ -959,8 +822,7 @@ with tab_qc:
         st.subheader(f"QC report — overall status: {badge}")
         st.caption(
             "Each curve is checked against standard geomechanical ranges "
-            "(expressed in the units shown in the Unit column). "
-            "LOW/HIGH = outside range, MISSING = null/non-numeric."
+            "(units shown in the Unit column). LOW/HIGH = outside range, MISSING = null/non-numeric."
         )
 
         def _pct_color(v):
@@ -984,7 +846,7 @@ with tab_qc:
             st.dataframe(
                 style_flags(disp.loc[bad_rows], flags_disp.loc[bad_rows], show_cols),
                 use_container_width=True,
-                height=350,
+                height=300,
             )
         else:
             st.success("All samples passed QC — no flags raised. 🎉")
@@ -1011,6 +873,13 @@ with tab_qc:
             ]
         st.plotly_chart(depth_track_figure(disp, DEPTH, composite_tracks, height=800), use_container_width=True)
 
+        if has_litho:
+            st.plotly_chart(
+                lithology_figure(disp[DEPTH], disp[N["LITHO_CODE"]], height=500),
+                use_container_width=True,
+                key="litho_qc",
+            )
+
         with st.expander("Crossplot explorer"):
             numeric_cols = [c for c in disp.columns if pd.api.types.is_numeric_dtype(disp[c])]
             c1, c2, c3 = st.columns(3)
@@ -1019,9 +888,7 @@ with tab_qc:
             color_col = c3.selectbox("Color by", numeric_cols, index=numeric_cols.index(N["GR"]) if N.get("GR") in numeric_cols else 0)
             xfig = go.Figure(
                 go.Scatter(
-                    x=disp[x_col],
-                    y=disp[y_col],
-                    mode="markers",
+                    x=disp[x_col], y=disp[y_col], mode="markers",
                     marker=dict(color=disp[color_col], colorscale="Viridis", showscale=True, colorbar_title=color_col),
                     hovertemplate=f"{x_col}: %{{x:.3f}}<br>{y_col}: %{{y:.3f}}<extra></extra>",
                 )
@@ -1037,6 +904,62 @@ with tab_qc:
             mime="text/csv",
             type="primary",
         )
+
+# --- Tab 8: Sensitivity analysis (Tornado plot) -----------------------------
+with tab_tornado:
+    st.subheader("Sensitivity Analysis (Tornado Plot)")
+    st.markdown(
+        "Using the loaded data as the *base case*, each input (GR, RHOB, DTCO, DTSM, POROSITY and "
+        "the static YME multiplier) is varied one at a time by the selected percentage while everything "
+        "else is held fixed, and the workflow is recomputed. Bars show how the depth-averaged target "
+        "moves — longer bar = more sensitive. GR has no bar unless the target depends on it "
+        "(e.g. GR-linear FANG); POROSITY only matters for the Morales static method."
+    )
+    if st.session_state.raw_df is None:
+        st.info("👈 Load data in the sidebar first — the tornado plot needs a base case.")
+    else:
+        c1, c2 = st.columns(2)
+        tornado_targets = list(mc.TORNADO_TARGETS)
+        if stress_params is not None:
+            tornado_targets += mc.TORNADO_STRESS_TARGETS
+        target_options = [mc.display_name(t, unit_system) for t in tornado_targets]
+        target_label_sel = c1.selectbox("Target Output", target_options, index=0, key="tornado_target",
+                                        help="Result whose sensitivity is analysed (depth-averaged mean).")
+        target_canonical = tornado_targets[target_options.index(target_label_sel)]
+        variation_pct = c2.select_slider("Variation Range", options=[5, 10, 20], value=10,
+                                         format_func=lambda v: f"±{v}%", key="tornado_pct")
+
+        if st.button("🌪️ Generate Tornado Plot", type="primary", key="tornado_btn"):
+            try:
+                with st.spinner("Recomputing the workflow for each input variation..."):
+                    fig, table, base_disp, skipped = mc.generate_tornado_plot(
+                        st.session_state.raw_df, column_map, target_canonical, variation_pct,
+                        **workflow_settings,
+                    )
+                st.session_state.tornado = {
+                    "fig": fig, "table": table, "base": base_disp, "skipped": skipped,
+                    "target_label": mc.display_name(target_canonical, unit_system),
+                    "pct": variation_pct, "units": unit_system, "method": method_label,
+                }
+            except ValueError as exc:
+                st.session_state.tornado = None
+                st.error(f"⚠️ {exc}")
+            except Exception as exc:  # keep the app alive on unexpected input
+                st.session_state.tornado = None
+                st.error(f"Unexpected error during sensitivity analysis: {exc}")
+
+        tornado = st.session_state.tornado
+        if tornado is not None:
+            st.metric(f"Base case — depth-averaged {tornado['target_label']}", f"{tornado['base']:.3f}")
+            st.plotly_chart(tornado["fig"], use_container_width=True)
+            st.markdown("**Per-parameter results** (sorted by impact):")
+            st.dataframe(tornado["table"].style.format(precision=3), use_container_width=True, hide_index=True)
+            if tornado["skipped"]:
+                st.info("Skipped (not mapped or could not be recomputed): " + ", ".join(tornado["skipped"]))
+            st.caption(
+                f"Generated with ±{tornado['pct']}% variation · {tornado['units']} · "
+                f"static method: {tornado['method']}. Re-generate after changing data or settings."
+            )
 
 st.divider()
 st.caption(
