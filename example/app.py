@@ -526,12 +526,6 @@ if run_clicked:
 # Main area
 # ---------------------------------------------------------------------------
 
-st.title("Quick MEM Calculator")
-st.markdown(
-    "Build a quick-look **Mechanical Earth Model** from standard well logs: "
-    "dynamic → static properties → rock strength → stresses → mud weight window, with built-in QC."
-)
-
 for warning in st.session_state.unit_warnings:
     st.warning(f"⚠️ Unit check: {warning}")
 
