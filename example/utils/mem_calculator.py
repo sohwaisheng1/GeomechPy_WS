@@ -43,6 +43,7 @@ PA_TO_PSI = 1.0 / 6894.757293  # Pascal -> psi
 PA_TO_MPSI = PA_TO_PSI * 1e-6  # Pascal -> Mega-psi
 PSI_TO_MPA = 6894.757293e-6    # psi -> MPa
 MPA_TO_PSI = 1.0 / PSI_TO_MPA  # MPa -> psi
+GPA_TO_PSI = PA_TO_PSI / PA_TO_GPA  # GPa -> psi (~145037.7)
 GPA_TO_MPSI = PA_TO_MPSI / PA_TO_GPA  # GPa -> Mpsi (~0.145)
 GCC_TO_KGM3 = 1000.0           # g/cc -> kg/m3
 M_TO_FT = 1.0 / M_PER_FT       # metres -> feet
@@ -86,22 +87,22 @@ DISPLAY_SPEC: dict[str, tuple[str, tuple[str, float], tuple[str, float]]] = {
     "VP_MS": ("VP", ("ft/s", 1.0 / M_PER_FT), ("m/s", 1.0)),
     "VS_MS": ("VS", ("ft/s", 1.0 / M_PER_FT), ("m/s", 1.0)),
     "VPVS": ("VP/VS", ("-", 1.0), ("-", 1.0)),
-    "YME_DYN_GPA": ("YME_DYN", ("Mpsi", GPA_TO_MPSI), ("GPa", 1.0)),
+    "YME_DYN_GPA": ("YME_DYN", ("psi", GPA_TO_PSI), ("psi", GPA_TO_PSI)),  # forced psi
     "PR_DYN": ("PR_DYN", ("-", 1.0), ("-", 1.0)),
     "K_DYN_GPA": ("K_DYN", ("Mpsi", GPA_TO_MPSI), ("GPa", 1.0)),
     "G_DYN_GPA": ("G_DYN", ("Mpsi", GPA_TO_MPSI), ("GPa", 1.0)),
     "LAME_DYN_GPA": ("LAME_DYN", ("Mpsi", GPA_TO_MPSI), ("GPa", 1.0)),
     "M_DYN_GPA": ("M_DYN", ("Mpsi", GPA_TO_MPSI), ("GPa", 1.0)),
-    "YME_STA_GPA": ("YME_STA", ("Mpsi", GPA_TO_MPSI), ("GPa", 1.0)),
+    "YME_STA_GPA": ("YME_STA", ("psi", GPA_TO_PSI), ("psi", GPA_TO_PSI)),  # forced psi
     "PR_STA": ("PR_STA", ("-", 1.0), ("-", 1.0)),
-    "UCS_MPA": ("UCS", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
-    "TSTR_MPA": ("TSTR", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
+    "UCS_MPA": ("UCS", ("psi", MPA_TO_PSI), ("psi", MPA_TO_PSI)),  # forced psi
+    "TSTR_MPA": ("TSTR", ("psi", MPA_TO_PSI), ("psi", MPA_TO_PSI)),  # forced psi
     "FANG_DEG": ("FANG", ("deg", 1.0), ("deg", 1.0)),
     # --- NEW: stress profile & wellbore stability columns ---
-    "SV_MPA": ("SV", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
-    "PP_MPA": ("PP", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
-    "SHMIN_MPA": ("SHMIN", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
-    "SHMAX_MPA": ("SHMAX", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
+    "SV_MPA": ("SV", ("psi", MPA_TO_PSI), ("psi", MPA_TO_PSI)),  # forced psi
+    "PP_MPA": ("PP", ("psi", MPA_TO_PSI), ("psi", MPA_TO_PSI)),  # forced psi
+    "SHMIN_MPA": ("SHMIN", ("psi", MPA_TO_PSI), ("psi", MPA_TO_PSI)),  # forced psi
+    "SHMAX_MPA": ("SHMAX", ("psi", MPA_TO_PSI), ("psi", MPA_TO_PSI)),  # forced psi
     "Q_FACTOR": ("Q_FACTOR", ("-", 1.0), ("-", 1.0)),
     "SH_RATIO": ("SHMAX/SHMIN", ("-", 1.0), ("-", 1.0)),
     "PW_BREAKOUT_MPA": ("PW_BREAKOUT", ("psi", MPA_TO_PSI), ("MPa", 1.0)),
@@ -208,7 +209,7 @@ def check_unit_sanity(data: pd.DataFrame, column_map: dict[str, str], unit_syste
 
 # QC validation ranges in CANONICAL units: column -> (min, max, unit).
 QC_RANGES = {
-    "GR": (0.0, 200.0, "gAPI"),
+    "GR": (0.0, 250.0, "gAPI"),
     "RHOB": (1.5, 3.2, "g/cc"),
     "DTCO": (40.0, 240.0, "us/ft"),
     "DTSM": (60.0, 450.0, "us/ft"),
@@ -326,7 +327,18 @@ def load_data(uploaded_file) -> tuple[pd.DataFrame, list[str]]:
     """
     name = uploaded_file.name.lower()
     try:
-        if name.endswith((".csv", ".txt")):
+        if name.endswith(".las"):
+            import lasio  # optional dependency; only needed for LAS input
+            try:
+                uploaded_file.seek(0)
+            except Exception:
+                pass
+            raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+            text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else raw
+            las = lasio.read(io.StringIO(text))
+            # las.df() is indexed by the depth curve (e.g. DEPT); expose it as a column.
+            df = las.df().reset_index()
+        elif name.endswith((".csv", ".txt")):
             df = pd.read_csv(uploaded_file, skip_blank_lines=True)
             # Single-column result usually means a non-comma delimiter: re-sniff.
             if df.shape[1] == 1:
@@ -335,7 +347,7 @@ def load_data(uploaded_file) -> tuple[pd.DataFrame, list[str]]:
         elif name.endswith((".xls", ".xlsx")):
             df = pd.read_excel(uploaded_file)
         else:
-            raise ValueError("Unsupported file type. Please upload a .csv, .xls or .xlsx file.")
+            raise ValueError("Unsupported file type. Please upload a .las, .csv, .xls or .xlsx file.")
     except ValueError:
         raise
     except Exception as exc:
@@ -1069,58 +1081,30 @@ def analyze_stress_barriers(
 # NEW: Mechanical stratigraphy (GR-based lithology flag)
 # ---------------------------------------------------------------------------
 
-# Lithology codes requested: sandstone 0, shale 1, limestone 2, coal 6.
-LITHO_NAME_BY_CODE = {0: "Sandstone", 1: "Shale", 2: "Limestone", 6: "Coal"}
+# Simplified lithology: sandstone (0) vs shale (1) split by a single GR cutoff.
+LITHO_NAME_BY_CODE = {0: "Sandstone", 1: "Shale"}
 LITHO_CODE_BY_NAME = {v: k for k, v in LITHO_NAME_BY_CODE.items()}
 # Display colours per code (+ -1 / NaN = undefined).
-LITHO_COLORS = {0: "#f4d03f", 1: "#7f8c8d", 2: "#5dade2", 6: "#17202a", -1: "#ecf0f1"}
+LITHO_COLORS = {0: "#f4d03f", 1: "#7f8c8d", -1: "#ecf0f1"}
+
+DEFAULT_GR_CUTOFF = 75.0  # gAPI: GR < cutoff -> sandstone (0), GR >= cutoff -> shale (1)
 
 
-def default_litho_config() -> list[dict]:
-    """Default GR windows per lithology: [gr_min, gr_max) in gAPI, first match wins.
+def compute_mechanical_stratigraphy(df: pd.DataFrame, gr_cutoff: float = DEFAULT_GR_CUTOFF) -> pd.DataFrame:
+    """NEW: add a LITHO_CODE column classifying each sample from GR by one cutoff.
 
-    Order in this list is the classification priority. Defaults are ascending,
-    non-overlapping GR bins covering 0-250 gAPI; users recalibrate per field.
-    """
-    return [
-        {"name": "Coal", "code": 6, "gr_min": 0.0, "gr_max": 10.0},
-        {"name": "Sandstone", "code": 0, "gr_min": 10.0, "gr_max": 65.0},
-        {"name": "Limestone", "code": 2, "gr_min": 65.0, "gr_max": 90.0},
-        {"name": "Shale", "code": 1, "gr_min": 90.0, "gr_max": 250.0},
-    ]
-
-
-def classify_lithology_value(gr: float, config: list[dict]) -> float:
-    """First lithology window [gr_min, gr_max) containing gr; NaN if none/invalid."""
-    if not np.isfinite(gr):
-        return np.nan
-    for row in config:
-        lo = row.get("gr_min")
-        hi = row.get("gr_max")
-        lo = -np.inf if lo is None or (isinstance(lo, float) and not np.isfinite(lo)) else float(lo)
-        hi = np.inf if hi is None or (isinstance(hi, float) and not np.isfinite(hi)) else float(hi)
-        if lo <= gr < hi:
-            try:
-                return float(row["code"])
-            except (KeyError, TypeError, ValueError):
-                return np.nan
-    return np.nan
-
-
-def compute_mechanical_stratigraphy(df: pd.DataFrame, litho_config: list[dict] | None = None) -> pd.DataFrame:
-    """NEW: add a LITHO_CODE column classifying each sample from GR.
-
-    litho_config is a list of {name, code, gr_min, gr_max} rows (priority = order).
-    Samples not matching any window (or with missing GR) get NaN.
+    GR < gr_cutoff  -> sandstone (code 0)
+    GR >= gr_cutoff -> shale     (code 1)
+    Missing GR      -> NaN
     """
     out = df.copy()
-    config = litho_config or default_litho_config()
     gr = (
         pd.to_numeric(out["GR"], errors="coerce").to_numpy(dtype=float)
         if "GR" in out.columns
         else np.full(len(out), np.nan)
     )
-    out["LITHO_CODE"] = [classify_lithology_value(v, config) for v in gr]
+    code = np.where(np.isfinite(gr), np.where(gr < float(gr_cutoff), 0.0, 1.0), np.nan)
+    out["LITHO_CODE"] = code
     return out
 
 
@@ -1162,7 +1146,7 @@ def run_full_workflow(
     fang_gr_min: float = 15.0,
     fang_gr_max: float = 120.0,
     ucs_multiplier: float = 1.0,
-    litho_config: list[dict] | None = None,
+    gr_cutoff: float | None = None,
     stress_params: dict | None = None,
 ) -> pd.DataFrame:
     """Rename mapped columns to standard mnemonics, convert the input to
@@ -1202,8 +1186,8 @@ def run_full_workflow(
         fang_gr_max=fang_gr_max,
         ucs_multiplier=ucs_multiplier,
     )
-    if litho_config is not None:  # None => user disabled lithology flagging
-        df = compute_mechanical_stratigraphy(df, litho_config)
+    if gr_cutoff is not None:  # None => user disabled lithology flagging
+        df = compute_mechanical_stratigraphy(df, gr_cutoff)
     if stress_params is not None:
         df = compute_stress_profile(df, stress_params)
     return df
@@ -1264,7 +1248,7 @@ def run_tornado_analysis(
     fang_gr_min: float = 15.0,
     fang_gr_max: float = 120.0,
     ucs_multiplier: float = 1.0,
-    litho_config: list[dict] | None = None,
+    gr_cutoff: float | None = None,
     stress_params: dict | None = None,
 ) -> tuple[pd.DataFrame, float, list[str]]:
     """One-at-a-time sensitivity of a target output to the main inputs.
@@ -1301,7 +1285,7 @@ def run_tornado_analysis(
         fang_gr_min=fang_gr_min,
         fang_gr_max=fang_gr_max,
         ucs_multiplier=ucs_multiplier,
-        litho_config=litho_config,
+        gr_cutoff=gr_cutoff,
         stress_params=stress_params,
     )
 
