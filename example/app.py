@@ -973,7 +973,7 @@ with tab_qc:
                 ),
                 (
                     f"Mud window ({mw_unit})",
-                    [(N["MW_BREAKOUT_GCC"], "MW min"), (N["MW_BREAKDOWN_GCC"], "MW max"), (N["MW_PP_GCC"], "Pp EMW")],
+                    [(N["MW_BREAKOUT_GCC"], "MW min"), (N["MW_LOSS_GCC"], "MW max"), (N["MW_PP_GCC"], "Pp EMW")],
                 ),
             ]
         st.plotly_chart(depth_track_figure(disp, DEPTH, composite_tracks, height=800, litho_codes=litho_arg), use_container_width=True)
