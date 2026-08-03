@@ -234,7 +234,7 @@ def mud_window_figure(disp: pd.DataFrame, depth_col: str, N: dict[str, str], uni
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.title("🪨 Quick MEM Calculator")
+    st.title("🪨 Quick 1D MEM-WBS Calculator")
     st.caption(
         "1D Mechanical Earth Model builder powered by "
         "[geomechpy](https://github.com/sohwaisheng1/GeomechPy_WS)."
@@ -589,7 +589,7 @@ def lithology_figure(depth_series, code_series, height: int = 650, title: str = 
     return fig
 
 
-st.title("Quick MEM Calculator")
+st.title("Quick 1D MEM-WBS Calculator User Inputs")
 st.markdown(
     "Build a quick-look **Mechanical Earth Model** from standard well logs: "
     "mechanical stratigraphy → stresses → rock properties → wellbore stability, with built-in QC."
