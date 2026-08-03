@@ -322,7 +322,7 @@ with st.sidebar:
         else:
             st.info("Load data first to map columns.")
 
-    with st.expander("4. Static properties", expanded=False):
+    with st.expander("5. Static properties", expanded=False):
         method_label = st.selectbox(
             "Dynamic → static YME correlation",
             list(mc.STATIC_YME_METHODS.keys()),
@@ -346,7 +346,7 @@ with st.sidebar:
             custom_a = st.number_input("Custom slope a", value=0.8, format="%.4f")
             custom_b = st.number_input("Custom intercept b (Mpsi)", value=0.0, format="%.4f")
 
-    with st.expander("5. Rock strength", expanded=False):
+    with st.expander("6. Rock strength", expanded=False):
         ucs_method_label = st.selectbox(
             "UCS method",
             list(mc.UCS_METHODS.keys()),
@@ -384,7 +384,7 @@ with st.sidebar:
             help="TSTR = ratio × UCS (geomechpy default is 0.15).",
         )
 
-    with st.expander("6. Mechanical stratigraphy", expanded=False):
+    with st.expander("4. Mechanical stratigraphy", expanded=False):
         # (2) Simplified lithology: one GR cutoff -> sandstone (0) vs shale (1)
         compute_litho = st.checkbox(
             "Flag lithology from GR",
