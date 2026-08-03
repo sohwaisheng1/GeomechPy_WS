@@ -24,7 +24,7 @@ from utils import mem_calculator as mc
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="Quick MEM Calculator",
+    page_title="Quick 1D MEM-WBS Calculator",
     page_icon="🪨",
     layout="wide",
     initial_sidebar_state="expanded",
