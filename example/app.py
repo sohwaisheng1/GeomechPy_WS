@@ -322,6 +322,22 @@ with st.sidebar:
         else:
             st.info("Load data first to map columns.")
 
+    with st.expander("4. Mechanical stratigraphy", expanded=False):
+        # (2) Simplified lithology: one GR cutoff -> sandstone (0) vs shale (1)
+        compute_litho = st.checkbox(
+            "Flag lithology from GR",
+            value=True,
+            help="Split each sample into sandstone (0) or shale (1) with a single GR cutoff. "
+            "The flag is shown on the stratigraphy tab and as a track on every output plot.",
+        )
+        gr_cutoff = None
+        if compute_litho:
+            gr_cutoff = st.slider(
+                "GR cutoff (gAPI)",
+                min_value=0.0, max_value=200.0, value=mc.DEFAULT_GR_CUTOFF, step=1.0,
+                help="GR below the cutoff = sandstone (0); at or above = shale (1).",
+            )
+    
     with st.expander("5. Static properties", expanded=False):
         method_label = st.selectbox(
             "Dynamic → static YME correlation",
@@ -383,22 +399,6 @@ with st.sidebar:
             min_value=0.05, max_value=0.30, value=0.15, step=0.01,
             help="TSTR = ratio × UCS (geomechpy default is 0.15).",
         )
-
-    with st.expander("4. Mechanical stratigraphy", expanded=False):
-        # (2) Simplified lithology: one GR cutoff -> sandstone (0) vs shale (1)
-        compute_litho = st.checkbox(
-            "Flag lithology from GR",
-            value=True,
-            help="Split each sample into sandstone (0) or shale (1) with a single GR cutoff. "
-            "The flag is shown on the stratigraphy tab and as a track on every output plot.",
-        )
-        gr_cutoff = None
-        if compute_litho:
-            gr_cutoff = st.slider(
-                "GR cutoff (gAPI)",
-                min_value=0.0, max_value=200.0, value=mc.DEFAULT_GR_CUTOFF, step=1.0,
-                help="GR below the cutoff = sandstone (0); at or above = shale (1).",
-            )
 
     with st.expander("7. Stress & wellbore stability", expanded=False):
         compute_stress = st.checkbox(
